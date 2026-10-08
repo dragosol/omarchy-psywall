@@ -31,25 +31,20 @@ Your wallpaper and your Philips Hue lights, moving to whatever's playing.
 
 ## Install
 
-### 1. Install
-
-From the [Omarchy Plugin Marketplace](https://omarchyplugins.com/), or:
-
 ```bash
-omarchy plugin add https://github.com/dragosol/omarchy-psywall.git
+omarchy plugin add https://github.com/dragosol/omarchy-psywall.git --enable
 ```
 
-### 2. Enable
+Omarchy installs third-party plugins disabled unless `--enable` is provided.
+Review the repository before enabling it: shell plugins run unsandboxed with
+your user permissions.
 
-```bash
-omarchy-shell shell rescanPlugins
-omarchy plugin enable io.github.dragosol.psywall --section right
-omarchy restart shell
-```
+That is the whole installation: everything Psywall uses already ships with
+Omarchy. The wallpaper effect starts with the next song. Add **Psywall** to
+the bar from the bar's widget settings if it is not placed for you (it
+defaults to the right section).
 
-The wallpaper effect starts with the next song.
-
-### 3. Connect your Hue lights (optional)
+## Connect your Hue lights (optional)
 
 Click the Psywall dots in the bar, then **Connect Hue lights**.
 
