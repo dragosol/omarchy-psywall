@@ -39,6 +39,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import huelib  # noqa: E402
 
 AREA_NAME = "Psywall"
+REPAIR = ("Psywall now checks it's talking to your own bridge before sending its key. "
+          "Press the bridge's link button once to pair again; your lights and their places are kept.")
 MAX_BEAT = 10        # the bridge refuses an 11th light, with an unhelpful error
 POLL = 2.0           # s between pairing attempts
 RESTORE = os.path.join(huelib.CONF_DIR, "hue-restore.json")
@@ -62,7 +64,7 @@ def probe(addr, timeout=3):
     host, port = huelib.split_host(addr)
     if not huelib.local_address(host):
         return None
-    conn = huelib.Conn(addr, "", timeout)
+    conn = huelib.Conn(addr, "", timeout, anonymous=True)   # no credential on this one
     try:
         conn.request("GET", "/api/0/config")
         resp = conn.getresponse()
@@ -189,7 +191,9 @@ def cmd_pair(addr, seconds="120"):
                     "clientkey": ok["clientkey"], "fingerprint": pin}
             huelib.save_conf(conf)
             room = huelib.load_lights() or {}
-            if (room.get("bridge") or {}).get("id") != b["id"]:
+            was = room.get("bridge") or {}
+            same = was.get("id") == b["id"] or (not was.get("id") and was.get("addr") == addr)
+            if not same:
                 room = {"lights": []}    # a different bridge: start the room afresh
             room["bridge"] = {"name": b["name"], "model": b["model"], "addr": addr, "id": b["id"]}
             huelib.save_lights(room)
@@ -206,9 +210,13 @@ def cmd_pair(addr, seconds="120"):
 
 def bridge():
     try:
-        return huelib.Bridge(huelib.load_conf())
+        conf = huelib.load_conf()
     except (OSError, ValueError, KeyError):
         fail("Not paired with a Hue bridge yet", code="unpaired")
+    try:
+        return huelib.Bridge(conf)
+    except huelib.Unpinned:
+        fail(REPAIR, code="repair")
 
 
 def snapshot(br):

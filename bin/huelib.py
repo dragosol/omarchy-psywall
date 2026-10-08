@@ -92,13 +92,6 @@ def save_lights(d, path=LIGHTS):
     save_json(d, path)
 
 
-def update_conf(**changes):
-    conf = load_conf()
-    conf.update(changes)
-    save_conf(conf)
-    return conf
-
-
 # ---- addresses -----------------------------------------------------------------
 
 def split_host(addr):
@@ -138,6 +131,11 @@ def local_address(host):
 MAX_BODY = 8 << 20   # no real bridge answers with more; a fake one can't flood memory
 
 
+class Unpinned(RuntimeError):
+    """A saved pairing without a certificate fingerprint (made before pinning
+    existed). Its key is never sent anywhere: the user pairs again, once."""
+
+
 class PinMismatch(ssl.SSLError):
     pass
 
@@ -158,10 +156,15 @@ class Conn(http.client.HTTPSConnection):
     """One kept-alive HTTPS connection that checks the pin on every connect,
     before a byte of the request goes out."""
 
-    def __init__(self, addr, pin, timeout=5):
+    def __init__(self, addr, pin, timeout=5, anonymous=False):
+        """pin: the fingerprint every connection must present. Only an
+        anonymous connection (the discovery probe, the pairing request: no
+        credential is sent on either) may go without one."""
         host, port = split_host(addr)
         if not local_address(host):
             raise ValueError("%s is not an address on the local network" % host)
+        if not pin and not anonymous:
+            raise Unpinned("no pinned certificate for this bridge")
         super().__init__(host, port, context=_ctx(), timeout=timeout)
         self.pin = pin
         self.seen = ""
@@ -182,7 +185,12 @@ class Bridge:
         self.user = conf["username"]
         self.key = conf["clientkey"]
         self.pin = conf.get("fingerprint", "")
+        if not self.pin:
+            # Never "pin on first use" here: that first use would already
+            # carry the key, to whatever answers at the saved address.
+            raise Unpinned("no pinned certificate for this bridge; pair again")
         self.conn = None
+        self.headers = None   # the last response's headers
 
     def raw(self, method, path, body=None, timeout=5, auth=True):
         """One request on the kept-alive connection (reopened once if the
@@ -199,6 +207,7 @@ class Bridge:
                 self.conn.request(method, path, body=data, headers=headers)
                 resp = self.conn.getresponse()
                 payload = resp.read(MAX_BODY + 1)
+                self.headers = resp.headers
                 if len(payload) > MAX_BODY:
                     raise BridgeError(resp.status, "the bridge's answer was too large")
                 break
@@ -209,17 +218,20 @@ class Bridge:
                 self.close()
                 if attempt:
                     raise
-        if not self.pin and self.conn is not None and self.conn.seen:
-            # A pairing from before pinning existed: pin what it talks to now.
-            self.pin = self.conn.seen
-            try:
-                update_conf(fingerprint=self.pin)
-            except (OSError, ValueError):
-                pass
         try:
             return resp.status, json.loads(payload or b"null")
         except ValueError:
             return resp.status, None
+
+    def application_id(self):
+        """The DTLS identity: this pairing's application id (GET /auth/v1, over
+        the pinned connection). Unlike the application key it is no secret,
+        and a DTLS identity crosses the network in the clear."""
+        status, _ = self.raw("GET", "/auth/v1")
+        app_id = (self.headers or {}).get("hue-application-id", "") if status < 400 else ""
+        if not app_id:
+            raise BridgeError(status, "the bridge didn't give an application id (needs a current bridge firmware)")
+        return app_id
 
     def req(self, method, path, body=None, timeout=5):
         """A CLIP v2 resource request; raises on an HTTP or bridge error."""
@@ -248,8 +260,8 @@ class BridgeError(RuntimeError):
 # ---- DTLS (the Entertainment API) ----------------------------------------------
 #
 # libssl through ctypes, so nothing secret is handed to another process.
-# DTLS 1.2, PSK-AES128-GCM-SHA256, identity = the application key, PSK = the
-# clientkey, port 2100 — the Hue Entertainment API's only combination.
+# DTLS 1.2, PSK-AES128-GCM-SHA256, identity = the application id (not the
+# key), PSK = the clientkey, port 2100 — the Hue Entertainment API's scheme.
 
 _ssl = None
 

@@ -57,6 +57,9 @@ Panel {
   // stands, and whether it streams live or takes slow fades. Empty until paired.
   property var room: null
   readonly property bool paired: !!(room && room.bridge)
+  // Paired before certificate pinning: the helper won't send the old key
+  // anywhere until the link button is pressed once more.
+  readonly property bool needsRepair: !!(status && String(status.hueState) === "repair")
   // A room written before the bridge's light ids were known (an older
   // pairing): drawn, but not movable until the first stream fills the ids in.
   readonly property bool roomComplete: layout.length > 0 && layout.every(function(l) { return !!l.id && l.id !== "undefined" })
@@ -422,8 +425,12 @@ Panel {
     setupOpen = true
     setupError = ""
     ipcQuiet(["hueHold"])
-    if (paired) { setupStep = "lights"; loadInventory() }
-    else { setupStep = "find"; discover() }
+    if (paired && !needsRepair) { setupStep = "lights"; loadInventory() }
+    else {
+      setupStep = "find"
+      discover()
+      if (needsRepair) setupError = "Psywall now checks it's talking to your own bridge before sending its key. Press the bridge's link button once to pair again; your lights and their places are kept."
+    }
   }
   function closeSetup() {
     setupOpen = false
@@ -530,10 +537,7 @@ Panel {
     setupRun(moveProc, ["move"].concat(m))
   }
   function ipcQuiet(args) { Quickshell.execDetached(["omarchy-shell", "psywall"].concat(args)); statusSoon.restart() }
-  function installMissing() {
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
-      "omarchy-pkg-add " + String(status.missing).replace(/[^a-z0-9.+_-]/g, "") + " && omarchy-shell psywall retry"])
-  }
+
 
   function parseEvents(text, fn) {
     var lines = String(text).split("\n")
@@ -578,7 +582,7 @@ Panel {
         if (o.event === "inventory") { root.initChoice(o); root.inventory = o }
         else if (o.event === "error") {
           root.setupError = o.message
-          if (o.code === "unpaired" || o.code === "pin") root.setupStep = "find"
+          if (o.code === "unpaired" || o.code === "pin" || o.code === "repair") { root.setupStep = "find"; root.discover() }
         }
       })
     }
@@ -1025,29 +1029,18 @@ Panel {
               id: missRow
               anchors.fill: parent
               anchors.margins: Style.space(8)
-              implicitHeight: Math.max(missText.implicitHeight, missBtn.implicitHeight)
+              implicitHeight: missText.implicitHeight
               Text {
                 id: missText
                 anchors.left: parent.left
-                anchors.right: missBtn.left
-                anchors.rightMargin: Style.space(10)
+                anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
-                text: "Psywall listens through " + String(root.status ? root.status.missing : "") + ", which isn't installed yet. Install it (asks for your password in a terminal) and the wallpaper and lights start."
+                text: "Psywall can't find " + String(root.status ? root.status.missing : "") + " (libfftw3f), which every Omarchy install includes. Reinstalling the fftw package brings it back."
                 color: root.popupText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-              }
-              Button {
-                id: missBtn
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Install"
-                fontFamily: root.fontFamily
-                foreground: root.popupText
-                bordered: true
-                onClicked: root.installMissing()
               }
             }
           }
@@ -1271,16 +1264,17 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: !root.paired ? "no Hue lights connected" : !root.enabled ? "psywall is off" : (!root.hueOn ? "lights are off" : "lights resting")
+                    text: !root.paired ? "no Hue lights connected" : !root.enabled ? "psywall is off"
+                      : (!root.hueOn ? "lights are off" : (root.needsRepair ? "press your bridge's button once to re-pair" : "lights resting"))
                     color: root.popupFaint
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.letterSpacing: 1.2
                   }
                   Button {
-                    visible: !root.paired
+                    visible: !root.paired || (root.needsRepair && root.hueOn)
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: "Connect Hue lights"
+                    text: root.paired ? "Pair again" : "Connect Hue lights"
                     iconText: "󰛨"
                     fontFamily: root.fontFamily
                     foreground: root.popupText

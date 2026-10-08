@@ -57,8 +57,8 @@ Item {
   }
   readonly property string helper: pluginDir + "/bin/psywall-audio"
 
-  // A package the audio helper needs and doesn't have (python-numpy is not
-  // part of a stock Omarchy install). The pane offers to install it.
+  // A library the audio helper can't find (libfftw3f: part of every Omarchy
+  // install, so only a damaged system shows this).
   property string missing: ""
 
   // ---- settings -----------------------------------------------------------

@@ -969,6 +969,7 @@ class Lights:
         self.layout = []     # names and places of the director's lights, for the view
         self.next_check = 0.0
         self.flash = None    # (slot, until): a light blinking for the pane
+        self.app_id = ""     # the DTLS identity, fetched once
 
     @property
     def active(self):
@@ -1037,8 +1038,10 @@ class Lights:
         self._write_restore()
 
         if area is not None:
+            if not self.app_id:
+                self.app_id = self.b.application_id()
             self.b.req("PUT", "entertainment_configuration/" + self.area_id, {"action": "start"})
-            self.dtls = huelib.DTLSStream(self.b.host, self.b.user, self.b.key)
+            self.dtls = huelib.DTLSStream(self.b.host, self.app_id, self.b.key)
             try:
                 self.dtls.handshake(HANDSHAKE)
             except huelib.DTLSError:
@@ -1184,7 +1187,10 @@ def restore_from_file(path=RESTORE):
         return
     if job.get("bridge") and job["bridge"] != conf["bridge"]:
         return   # paired with another bridge since: these lights aren't reachable
-    bridge = huelib.Bridge(conf)
+    try:
+        bridge = huelib.Bridge(conf)
+    except huelib.Unpinned:
+        return
     if job.get("area_id"):
         try:
             bridge.req("PUT", "entertainment_configuration/" + job["area_id"], {"action": "stop"})
@@ -1229,6 +1235,11 @@ def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     try:
         lights = Lights(huelib.load_conf())
+    except huelib.Unpinned:
+        # Paired before pinning existed: the key stays put until the user
+        # presses the link button again (the pane says so).
+        lights = None
+        say("repair")
     except (OSError, ValueError, KeyError):
         lights = None
         say("unpaired")

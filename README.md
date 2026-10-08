@@ -21,10 +21,8 @@ Your wallpaper and your Philips Hue lights, moving to whatever's playing.
 ## Requirements
 
 - Omarchy 4 (the Quickshell shell, Quickshell 0.3.x) on Hyprland.
-- `python-numpy`. Everything else ships with Omarchy: PipeWire, Python,
-  ImageMagick, Avahi and OpenSSL. If numpy is missing, the card says so and
-  its **Install** button runs `omarchy-pkg-add python-numpy` in a terminal,
-  where you see the password prompt yourself.
+- Nothing else to install: Psywall uses only what every Omarchy install
+  already has (Python, PipeWire, FFTW, ImageMagick, Avahi and OpenSSL).
 - For the lights: a Hue Bridge (the square second-generation one, or a Hue
   Bridge Pro) and colour lights that support Hue Entertainment, which is
   nearly every colour bulb, strip and lamp sold since 2016. White-only
@@ -35,20 +33,10 @@ Your wallpaper and your Philips Hue lights, moving to whatever's playing.
 
 ### 1. Install
 
-#### Via the marketplace
-
-Find Psywall in the [Omarchy Plugin Marketplace](https://omarchyplugins.com/)
-and run its install command:
+From the [Omarchy Plugin Marketplace](https://omarchyplugins.com/), or:
 
 ```bash
 omarchy plugin add https://github.com/dragosol/omarchy-psywall.git
-```
-
-#### Via Git
-
-```bash
-git clone https://github.com/dragosol/omarchy-psywall.git \
-  ~/.config/omarchy/plugins/io.github.dragosol.psywall
 ```
 
 ### 2. Enable
@@ -140,7 +128,9 @@ omarchy-shell psywall-view toggle | setup | arrange
   key. They're stored in `~/.config/psywall/hue.json`, created with mode 0600
   in a 0700 directory. They are never put on a command line, where other
   accounts on the machine could read them in `/proc`. Streaming uses DTLS
-  inside Psywall's own process, through the system's libssl. Anyone who
+  inside Psywall's own process, through the system's libssl, and identifies
+  itself with the pairing's application id, which isn't secret, so the key
+  never crosses the network in the clear. Anyone who
   can read your home directory, or a backup of it, can read the key, the
   same as with any app's saved login.
 - **Only your bridge.** Psywall only connects to IP addresses on your local
@@ -149,7 +139,9 @@ omarchy-shell psywall-view toggle | setup | arrange
   carry certificates issued to the bridge rather than to an address, so
   ordinary hostname checks can't apply). Every later connection must present
   that same certificate before anything is sent, so a device that takes over
-  the bridge's address afterwards gets nothing. What this can't cover is a
+  the bridge's address afterwards gets nothing. A saved pairing without a
+  recorded certificate is never used; Psywall asks for one more press of the
+  link button instead. What this can't cover is a
   device impersonating the bridge during the two minutes you're pairing;
   pair on a network you trust.
 - **Discovery.** Bridges are found with mDNS on your local network. Only if
@@ -166,7 +158,7 @@ omarchy-shell psywall-view toggle | setup | arrange
 ## Updates
 
 ```bash
-git -C ~/.config/omarchy/plugins/io.github.dragosol.psywall pull --ff-only
+omarchy plugin update io.github.dragosol.psywall
 omarchy restart shell
 ```
 
@@ -190,6 +182,10 @@ entertainment area called "Psywall" can be deleted in the Hue app.
 
 ## Troubleshooting
 
+- **"press your bridge's button once to re-pair"**: the pairing was made
+  before Psywall recorded bridge certificates, so its key isn't used until
+  you pair again. Click **Pair again** and press the bridge's button; your
+  lights and their places are kept.
 - **"lights resting"**: lights only run while music plays. Wait a few
   seconds after pressing play.
 - **The bridge isn't found**: check that the computer and the bridge are on

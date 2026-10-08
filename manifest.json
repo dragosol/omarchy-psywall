@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.dragosol.psywall",
   "name": "Psywall",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Dragos Robu",
   "license": "MIT",
   "description": "Your wallpaper and your Philips Hue lights, moving to whatever's playing. A subtle oil-slick tint flows through the dark parts of the wallpaper, and up to 10 Hue lights stream 50 times a second, passing the beat around the room instead of pulsing together. Pair the bridge, pick your lights and drag each one to where it stands, all from the bar.",

@@ -36,6 +36,7 @@ EOF on stdin (the shell went away) ends the process and both captures.
 import ctypes
 import fcntl
 import json
+import math
 import os
 import select
 import signal
@@ -45,12 +46,29 @@ import time
 import urllib.request
 from collections import deque
 
-try:
-    import numpy as np
-except ImportError:
-    # Not part of a stock Omarchy install; the psywall pane offers to add it.
-    print("S missing python-numpy", flush=True)
-    sys.exit(3)
+import array
+import ctypes.util
+
+
+def load_fftw():
+    """libfftw3f, single precision: part of every Omarchy install (pipewire-audio
+    and imagemagick depend on it), so nothing extra has to be installed."""
+    for name in ("libfftw3f.so.3", ctypes.util.find_library("fftw3f")):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        lib.fftwf_plan_dft_r2c_1d.restype = ctypes.c_void_p
+        lib.fftwf_plan_dft_r2c_1d.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        lib.fftwf_execute.argtypes = [ctypes.c_void_p]
+        return lib
+    return None
+
+
+FFTW_ESTIMATE = 1 << 6
+FFTW = load_fftw()
 
 RATE = 48000
 N = 2048
@@ -133,8 +151,8 @@ class Capture:
         say("S restart %s %.0fs %s" % (self.name, delay, why))
 
     def read(self):
-        """Everything queued in the pipe as one mono float32 block."""
-        empty = np.empty(0, dtype=np.float32)
+        """Everything queued in the pipe as one mono block (array of floats)."""
+        empty = array.array("f")
         if self.proc is None:
             return empty
         chunks = []
@@ -158,9 +176,13 @@ class Capture:
         self.pending = buf[usable:]
         if usable == 0:
             return empty
-        st = np.frombuffer(buf[:usable], dtype=np.float32).reshape(-1, 2)
-        mono = (st[:, 0] + st[:, 1]) * 0.5
-        return np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
+        st = array.array("f")
+        st.frombytes(buf[:usable])
+        mono = array.array("f", [(a + b) * 0.5 for a, b in zip(st[0::2], st[1::2])])
+        for i, v in enumerate(mono):
+            if v != v or v in (math.inf, -math.inf):   # NaN / inf from a bad buffer
+                mono[i] = 0.0
+        return mono
 
 
 class Gain:
@@ -258,16 +280,27 @@ KICK_GUARD = 0.05   # s; a kick's beater click lands in the melody band too
 
 class Features:
     def __init__(self):
-        self.window = np.hanning(N).astype(np.float32)
-        freqs = np.fft.rfftfreq(N, 1.0 / RATE)
-        self.masks = [(freqs >= lo) & (freqs < hi) for _, lo, hi in BANDS]
-        self.mel_mask = (freqs >= MEL_LO) & (freqs < MEL_HI)
+        if FFTW is None:
+            raise RuntimeError("libfftw3f not found")
+        # Hann window, as numpy.hanning(N)
+        self.window = [0.5 - 0.5 * math.cos(2 * math.pi * n / (N - 1)) for n in range(N)]
+        nb = N // 2 + 1
+        freqs = [k * RATE / N for k in range(nb)]
+        # contiguous bin ranges [i, j) per band
+        span = lambda lo, hi: (next(k for k, f in enumerate(freqs) if f >= lo),
+                               next((k for k, f in enumerate(freqs) if f >= hi), nb))
+        self.spans = [span(lo, hi) for _, lo, hi in BANDS]
+        self.mel_span = span(MEL_LO, MEL_HI)
         # a full-scale sine inside a band reads ~0 dB
-        self.scale = 4.0 / float(self.window.sum()) ** 2
+        self.scale = 4.0 / sum(self.window) ** 2
+        self.nb = nb
+        self.fin = (ctypes.c_float * N)()
+        self.fout = (ctypes.c_float * (2 * nb))()
+        self.plan = FFTW.fftwf_plan_dft_r2c_1d(N, self.fin, self.fout, FFTW_ESTIMATE)
         self.reset()
 
     def reset(self):
-        self.ring = np.zeros(N, dtype=np.float32)
+        self.ring = array.array("f", bytes(4 * N))
         self.gains = [Gain() for _ in BANDS]
         self.onset = Onset()
         self.accent = Accent()
@@ -278,25 +311,32 @@ class Features:
     def push(self, mono):
         m = len(mono)
         if m >= N:
-            self.ring[:] = mono[-N:]
+            self.ring = array.array("f", mono[-N:])
         else:
-            self.ring[:-m] = self.ring[m:]
-            self.ring[-m:] = mono
+            self.ring = self.ring[m:] + mono
+
+    def _power(self):
+        ring, win, fin = self.ring, self.window, self.fin
+        for i in range(N):
+            fin[i] = ring[i] * win[i]
+        FFTW.fftwf_execute(self.plan)
+        o, sc = self.fout, self.scale
+        return [(o[2 * k] * o[2 * k] + o[2 * k + 1] * o[2 * k + 1]) * sc for k in range(self.nb)]
 
     def frame(self, fresh, dt, now, onset_band):
         flux = 0.0
         if fresh:
-            spec = np.fft.rfft(self.ring * self.window)
-            power = (spec.real ** 2 + spec.imag ** 2) * self.scale
-            dbs = [max(FLOOR, 10.0 * np.log10(max(float(power[mk].sum()), 1e-12))) for mk in self.masks]
+            power = self._power()
+            dbs = [max(FLOOR, 10.0 * math.log10(max(sum(power[i:j]), 1e-12))) for i, j in self.spans]
             # Per-bin dB, floored 70 dB under the loudest bin of the whole
             # spectrum: a kick's leakage into this band sits far below that,
             # while a quiet hi-hat doesn't. (Flooring against this band's own
             # peak made a near-silent band's leakage look like big onsets.)
-            mel = 10.0 * np.log10(power[self.mel_mask] + 1e-12)
-            mel = np.maximum(mel, 10.0 * np.log10(float(power.max()) + 1e-12) - 70.0)
+            floor = 10.0 * math.log10(max(power) + 1e-12) - 70.0
+            i, j = self.mel_span
+            mel = [max(10.0 * math.log10(p + 1e-12), floor) for p in power[i:j]]
             if self.prev_mel is not None:
-                flux = float(np.maximum(mel - self.prev_mel, 0.0).mean())
+                flux = sum(max(a - b, 0.0) for a, b in zip(mel, self.prev_mel)) / len(mel)
             self.prev_mel = mel
         else:
             dbs = [FLOOR] * len(BANDS)
@@ -358,7 +398,7 @@ def output_ident(sink):
 def rms_db(mono):
     if not len(mono):
         return FLOOR
-    return max(FLOOR, 10.0 * np.log10(max(float(np.mean(mono * mono)), 1e-12)))
+    return max(FLOOR, 10.0 * math.log10(max(sum(v * v for v in mono) / len(mono), 1e-12)))
 
 
 def analyze(path):
@@ -368,22 +408,35 @@ def analyze(path):
         raw = subprocess.run(
             ["magick", path + "[0]", "-resize", "480x480>", "-depth", "8", "rgb:-"],
             capture_output=True, timeout=30).stdout
-        px = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.float32) / 255.0
-        if not len(px):
+        if len(raw) < 3:
             raise ValueError("no pixels")
     except Exception:
         return 0.0, 0.25
-    lum = px @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-    hist = np.bincount(np.clip((lum * 255).astype(int), 0, 255), minlength=256).astype(np.float64)
-    hist /= hist.sum()
-    w = np.cumsum(hist)
-    mu = np.cumsum(hist * np.arange(256))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        between = (mu[-1] * w - mu) ** 2 / (w * (1.0 - w))
-    t = int(np.argmax(np.nan_to_num(between, nan=0.0, posinf=0.0)))
-    hi = float(np.clip(t / 255.0, 0.08, 0.55))
-    dark = lum[lum <= hi]
-    lo = float(np.percentile(dark, 30)) if dark.size else 0.0
+    # Rec.709 luma per pixel, on a 0..255 scale, binned into a histogram.
+    lum = [0.2126 * raw[k] + 0.7152 * raw[k + 1] + 0.0722 * raw[k + 2] for k in range(0, len(raw) - 2, 3)]
+    hist = [0] * 256
+    for v in lum:
+        hist[min(255, max(0, int(v)))] += 1
+    total = float(len(lum))
+    # Otsu: the split that maximises the between-class variance
+    w = mu = 0.0
+    mu_t = sum(k * h for k, h in enumerate(hist)) / total
+    best, t = -1.0, 0
+    for k in range(256):
+        w += hist[k] / total
+        mu += k * hist[k] / total
+        if 0.0 < w < 1.0:
+            between = (mu_t * w - mu) ** 2 / (w * (1.0 - w))
+            if between > best:
+                best, t = between, k
+    hi = min(0.55, max(0.08, t / 255.0))
+    dark = sorted(v / 255.0 for v in lum if v / 255.0 <= hi)
+    if dark:   # 30th percentile, linear interpolation as numpy's default
+        pos = 0.3 * (len(dark) - 1)
+        f = int(pos)
+        lo = dark[f] + (dark[min(f + 1, len(dark) - 1)] - dark[f]) * (pos - f)
+    else:
+        lo = 0.0
     return max(0.0, min(lo, hi - 0.06)), hi
 
 
@@ -393,6 +446,12 @@ def wall_line(path):
 
 
 def main():
+    if FFTW is None:
+        # Say so once and idle until the plugin lets go (EOF on stdin), rather
+        # than exiting into a restart loop.
+        say("S missing fftw")
+        sys.stdin.read()
+        return
     args = sys.argv[1:]
     if len(args) == 2 and args[0] == "--analyze":
         print(wall_line(args[1]))
