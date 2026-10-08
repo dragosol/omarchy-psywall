@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""psywall-hue-setup — pairs psywall with a Philips Hue bridge, step by step,
+for the setup screens in the psywall pane. Every command prints JSON lines
+({"event": ...}) on stdout and exits; nothing secret is ever printed.
+
+  discover                 find bridges: mDNS (_hue._tcp, through avahi) and,
+                           if that finds none, Signify's discovery service
+  probe <addr>             is there a Hue bridge at this address?
+  pair <addr> [seconds]    poll the bridge while the user presses its link
+                           button; saves the keys (0600) and pins its certificate
+  inventory                the bridge's lights, rooms and entertainment areas
+  apply <json>             {"modes": {light id: "beat" | "dynamic" | "glow"},
+                            "area": existing area id or ""}: chooses which lights
+                           stream live (beat and dynamic ones, then glow ones
+                           while there's room: 10 at most), makes (or updates)
+                           the "Psywall" entertainment area for them unless an
+                           existing area was chosen, and saves the room
+  move <light id> <x> <y>  a light's place in the room (-1..1; y = 1 is the front)
+  identify <light id>      the light blinks, so you can see which one it is
+  forget                   delete the keys and the room from this computer
+
+Only literal addresses on the local network are contacted (no hostnames, no
+public addresses), apart from discovery.meethue.com when mDNS finds nothing.
+"""
+
+import json
+import math
+import re
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import huelib  # noqa: E402
+
+AREA_NAME = "Psywall"
+MAX_BEAT = 10        # the bridge refuses an 11th light, with an unhelpful error
+POLL = 2.0           # s between pairing attempts
+RESTORE = os.path.join(huelib.CONF_DIR, "hue-restore.json")
+
+
+def emit(**obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def fail(msg, **extra):
+    emit(event="error", message=msg, **extra)
+    sys.exit(1)
+
+
+# ---- discovery -----------------------------------------------------------------
+
+def probe(addr, timeout=3):
+    """The bridge's unauthenticated config, plus its certificate fingerprint.
+    None if nothing Hue-like answers there."""
+    host, port = huelib.split_host(addr)
+    if not huelib.local_address(host):
+        return None
+    conn = huelib.Conn(addr, "", timeout)
+    try:
+        conn.request("GET", "/api/0/config")
+        resp = conn.getresponse()
+        body = json.loads(resp.read(65536) or b"null")
+    except (OSError, ValueError, ssl.SSLError, Exception):
+        return None
+    finally:
+        fp = conn.seen
+        conn.close()
+    if not isinstance(body, dict) or not body.get("bridgeid"):
+        return None
+    return {"addr": addr, "name": str(body.get("name") or "Hue Bridge")[:64],
+            "id": str(body["bridgeid"]).lower()[:32], "model": str(body.get("modelid") or "")[:16],
+            "api": str(body.get("apiversion") or "")[:16], "fingerprint": fp}
+
+
+def _mdns(found):
+    try:
+        out = subprocess.run(["avahi-browse", "-rptk", "_hue._tcp"], capture_output=True,
+                             text=True, timeout=6).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    for line in out.splitlines():
+        f = line.split(";")
+        # =;iface;IPv4;name;_hue._tcp;local;host;address;port;txt
+        if len(f) >= 9 and f[0] == "=" and f[2] == "IPv4":
+            port = f[8] if f[8].isdigit() else "443"
+            found.append(f[7] if port == "443" else "%s:%s" % (f[7], port))
+
+
+def _cloud(found):
+    try:
+        req = urllib.request.Request("https://discovery.meethue.com/",
+                                     headers={"User-Agent": "psywall"})
+        with urllib.request.urlopen(req, timeout=5, context=ssl.create_default_context()) as r:
+            items = json.loads(r.read(65536))
+    except Exception:
+        return
+    for it in items if isinstance(items, list) else []:
+        ip = str(it.get("internalipaddress", "")) if isinstance(it, dict) else ""
+        port = it.get("port", 443) if isinstance(it, dict) else 443
+        if ip:
+            found.append(ip if port in (443, "443", None) else "%s:%s" % (ip, port))
+
+
+def cmd_discover():
+    found = []
+    _mdns(found)
+    if not found:
+        emit(event="searching", via="discovery.meethue.com")
+        _cloud(found)
+    seen = set()
+    results = []
+    lock = threading.Lock()
+
+    def check(addr):
+        b = probe(addr)
+        if b:
+            with lock:
+                if b["id"] in seen:
+                    return
+                seen.add(b["id"])
+                results.append(b)
+            b.pop("fingerprint", None)
+            emit(event="bridge", **b)
+
+    threads = [threading.Thread(target=check, args=(a,)) for a in dict.fromkeys(found)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    emit(event="done", count=len(results))
+
+
+def cmd_probe(addr):
+    b = probe(addr)
+    if not b:
+        host, _ = huelib.split_host(addr)
+        if not huelib.local_address(host):
+            fail("Enter the bridge's IP address on your network, like 192.168.1.20")
+        fail("No Hue bridge answered at %s" % addr)
+    b.pop("fingerprint", None)
+    emit(event="bridge", **b)
+
+
+# ---- pairing -------------------------------------------------------------------
+
+def devicetype():
+    # <app>#<device>: the bridge allows 20 + 19 characters.
+    host = "".join(c for c in socket.gethostname().split(".")[0] if c.isalnum() or c in "-_")
+    return "psywall#" + (host or "omarchy")[:19]
+
+
+def cmd_pair(addr, seconds="120"):
+    b = probe(addr)
+    if not b:
+        fail("No Hue bridge answered at %s" % addr)
+    pin = b["fingerprint"]
+    deadline = time.monotonic() + max(10, min(600, int(float(seconds))))
+    body = json.dumps({"devicetype": devicetype(), "generateclientkey": True})
+    conn = None
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            emit(event="timeout")
+            return
+        try:
+            if conn is None:
+                conn = huelib.Conn(addr, pin, 5)
+            conn.request("POST", "/api", body=body, headers={"Content-Type": "application/json"})
+            out = json.loads(conn.getresponse().read(65536) or b"null")
+        except huelib.PinMismatch:
+            fail("The bridge's certificate changed during pairing. Try again.")
+        except (OSError, ValueError, Exception):
+            if conn is not None:
+                conn.close()
+            conn = None
+            out = None
+        item = out[0] if isinstance(out, list) and out and isinstance(out[0], dict) else {}
+        ok = item.get("success") or {}
+        if ok.get("username") and ok.get("clientkey"):
+            conn.close()
+            conf = {"bridge": addr, "bridgeid": b["id"], "username": ok["username"],
+                    "clientkey": ok["clientkey"], "fingerprint": pin}
+            huelib.save_conf(conf)
+            room = huelib.load_lights() or {}
+            if (room.get("bridge") or {}).get("id") != b["id"]:
+                room = {"lights": []}    # a different bridge: start the room afresh
+            room["bridge"] = {"name": b["name"], "model": b["model"], "addr": addr, "id": b["id"]}
+            huelib.save_lights(room)
+            emit(event="paired", name=b["name"], id=b["id"], model=b["model"], addr=addr)
+            return
+        err = item.get("error") or {}
+        if err and err.get("type") != 101:
+            fail("The bridge refused pairing: %s" % str(err.get("description", "unknown error"))[:120])
+        emit(event="waiting", left=int(left), reachable=out is not None)
+        time.sleep(min(POLL, max(0.1, left)))
+
+
+# ---- the room ------------------------------------------------------------------
+
+def bridge():
+    try:
+        return huelib.Bridge(huelib.load_conf())
+    except (OSError, ValueError, KeyError):
+        fail("Not paired with a Hue bridge yet", code="unpaired")
+
+
+def snapshot(br):
+    """lights (with rooms, colour and entertainment service) and areas."""
+    get = lambda r: br.req("GET", r)["data"]
+    lights, devices, rooms, ents, areas = (get(r) for r in
+        ("light", "device", "room", "entertainment", "entertainment_configuration"))
+    room_of = {}
+    for rm in rooms:
+        for ch in rm.get("children", []):
+            if ch.get("rtype") == "device":
+                room_of[ch["rid"]] = rm["metadata"]["name"]
+    ent_of = {}      # light id -> entertainment service id (renderers only)
+    light_of = {}    # entertainment service id -> light id
+    for e in ents:
+        ref = e.get("renderer_reference") or {}
+        if e.get("renderer") and ref.get("rid"):
+            ent_of[ref["rid"]] = e["id"]
+            light_of[e["id"]] = ref["rid"]
+    out_lights = []
+    for l in lights:
+        owner = (l.get("owner") or {}).get("rid", "")
+        out_lights.append({
+            "id": l["id"], "name": l["metadata"]["name"], "room": room_of.get(owner, ""),
+            "archetype": l["metadata"].get("archetype", ""),
+            "color": bool(l.get("color")), "gradient": bool(l.get("gradient")),
+            "ent": ent_of.get(l["id"], ""), "on": bool((l.get("on") or {}).get("on")),
+        })
+    out_areas = []
+    for a in areas:
+        pos = {}
+        for c in a.get("channels", []):
+            for m in c.get("members", []):
+                lid = light_of.get((m.get("service") or {}).get("rid"))
+                if lid and lid not in pos:
+                    pos[lid] = {"x": c["position"]["x"], "y": c["position"]["y"]}
+        if not pos:   # no channels yet: the locations the area was made with
+            for sl in (a.get("locations") or {}).get("service_locations", []):
+                lid = light_of.get((sl.get("service") or {}).get("rid"))
+                p = (sl.get("positions") or [sl.get("position")])[0] or {}
+                if lid and "x" in p:
+                    pos[lid] = {"x": p["x"], "y": p["y"]}
+        out_areas.append({"id": a["id"], "name": a["metadata"]["name"],
+                          "type": a.get("configuration_type", ""), "status": a.get("status", ""),
+                          "lights": list(pos), "positions": pos})
+    return out_lights, out_areas
+
+
+def cmd_inventory():
+    br = bridge()
+    try:
+        lights, areas = snapshot(br)
+    except huelib.PinMismatch:
+        fail("This bridge's certificate changed since pairing. Pair again.", code="pin")
+    except Exception as exc:
+        fail("Couldn't reach the bridge (%s)" % str(exc)[:100], code="unreachable")
+    room = huelib.load_lights() or {}
+    emit(event="inventory", lights=lights, areas=areas, room=room)
+
+
+def auto_place(ids, known):
+    """Lights without a known place: an even ring, so none overlap."""
+    out = {}
+    free = [i for i in ids if i not in known]
+    for k, lid in enumerate(free):
+        a = 2 * math.pi * k / max(1, len(free)) + math.pi / 2
+        out[lid] = {"x": round(0.75 * math.cos(a), 3), "y": round(0.75 * math.sin(a), 3)}
+    out.update({i: known[i] for i in ids if i in known})
+    return out
+
+
+def locations(beat, by_id, pos):
+    return {"service_locations": [
+        {"service": {"rid": by_id[i]["ent"], "rtype": "entertainment"},
+         "positions": [{"x": pos[i]["x"], "y": pos[i]["y"], "z": 0.0}]} for i in beat]}
+
+
+def live_of(l):
+    """lights.json: streamed? (files from before modes: "glow" meant not)."""
+    return l.get("live", l.get("mode") != "glow")
+
+
+def cmd_apply(spec):
+    try:
+        spec = json.loads(spec)
+        modes = {str(k): str(v) for k, v in (spec.get("modes") or {}).items() if v in ("beat", "dynamic", "glow")}
+        chosen = str(spec.get("area") or "")
+    except (ValueError, AttributeError):
+        fail("bad request")
+    br = bridge()
+    lights, areas = snapshot(br)
+    by_id = {l["id"]: l for l in lights}
+    area_by_id = {a["id"]: a for a in areas}
+    room = huelib.load_lights() or {}
+    known = {l["id"]: {"x": l["x"], "y": l["y"]} for l in room.get("lights", []) if "x" in l}
+    ordered = [l["id"] for l in lights if l["id"] in modes]
+    bad = [i for i in ordered if not by_id[i].get("ent") or not by_id[i].get("color")]
+    if bad:
+        fail("%s can't take part in a light show" % by_id[bad[0]]["name"])
+    rhythm = [i for i in ordered if modes[i] != "glow"]
+    glow = [i for i in ordered if modes[i] == "glow"]
+
+    if chosen:
+        if chosen not in area_by_id:
+            fail("That entertainment area is gone. Search again.")
+        live = [i for i in area_by_id[chosen]["lights"] if i in modes]
+        outside = [i for i in rhythm if i not in live]
+        if outside:
+            fail("%s isn't in %s, so it can only glow" % (by_id[outside[0]]["name"], area_by_id[chosen]["name"]))
+        area_id = chosen
+        known.update(area_by_id[chosen]["positions"])   # the area's own places win
+    else:
+        if len(rhythm) > MAX_BEAT:
+            fail("A Hue bridge streams at most %d lights at once: set the others to Glow" % MAX_BEAT)
+        live = rhythm + glow[:MAX_BEAT - len(rhythm)]
+        for a in areas:   # places other apps already gave these lights
+            for lid, p in a["positions"].items():
+                if lid not in known and (abs(p["x"]) > 0.01 or abs(p["y"]) > 0.01):
+                    known[lid] = p
+        area_id = ""
+        own = room.get("ownArea")
+        if live:
+            pos = auto_place(live, known)
+            body = {"metadata": {"name": AREA_NAME}, "configuration_type": "music",
+                    "locations": locations(live, by_id, pos)}
+            if own in area_by_id:
+                if area_by_id[own]["status"] == "active":
+                    br.req("PUT", "entertainment_configuration/" + own, {"action": "stop"})
+                br.req("PUT", "entertainment_configuration/" + own, body)
+                area_id = own
+            else:
+                body["type"] = "entertainment_configuration"
+                try:
+                    area_id = br.req("POST", "entertainment_configuration", body)["data"][0]["rid"]
+                except huelib.BridgeError as exc:
+                    fail("The bridge wouldn't make the area: %s" % exc)
+                room["ownArea"] = area_id
+            # The bridge rewrites places and reorders channels: read them back.
+            _, areas = snapshot(br)
+            known.update(next((a["positions"] for a in areas if a["id"] == area_id), {}))
+        elif own in area_by_id:
+            br.req("DELETE", "entertainment_configuration/" + own)
+            room.pop("ownArea", None)
+
+    slow = [i for i in ordered if i not in live]
+    pos = auto_place(live, known)
+    # Slow lights default to a row along the bottom of the map, out of the way.
+    for k, lid in enumerate(slow):
+        pos[lid] = known.get(lid) or {"x": round(-0.8 + 1.6 * k / max(1, len(slow) - 1), 3) if len(slow) > 1 else 0.0,
+                                      "y": -0.85}
+    room["area"] = area_id
+    room["areaName"] = area_by_id[area_id]["name"] if area_id in area_by_id else (AREA_NAME if area_id else "")
+    room["lights"] = [{"id": i, "name": by_id[i]["name"], "room": by_id[i]["room"], "x": pos[i]["x"],
+                       "y": pos[i]["y"], "mode": modes.get(i, "dynamic"), "live": i in live}
+                      for i in live + slow]
+    huelib.save_lights(room)
+    emit(event="applied", area=area_id, live=len(live), slow=len(slow))
+
+
+def cmd_move(lid, x, y):
+    room = huelib.load_lights()
+    if not room:
+        fail("Not paired with a Hue bridge yet", code="unpaired")
+    clamp = lambda v: round(max(-1.0, min(1.0, float(v))), 3)
+    hit = None
+    for l in room.get("lights", []):
+        if l["id"] == lid:
+            l["x"], l["y"] = clamp(x), clamp(y)
+            hit = l
+    if not hit:
+        fail("No such light")
+    huelib.save_lights(room)
+    emit(event="moved", id=lid, x=hit["x"], y=hit["y"])
+    # The area's own copy, so other Hue apps agree — only for the area psywall
+    # made, and not while it streams (the bridge refuses then; this file wins).
+    if live_of(hit) and room.get("area") and room.get("area") == room.get("ownArea"):
+        try:
+            br = bridge()
+            lights, areas = snapshot(br)
+            area = next((a for a in areas if a["id"] == room["area"]), None)
+            if area and area["status"] != "active":
+                by_id = {l["id"]: l for l in lights}
+                beat = [l["id"] for l in room["lights"] if live_of(l) and l["id"] in by_id]
+                pos = {l["id"]: l for l in room["lights"]}
+                br.req("PUT", "entertainment_configuration/" + room["area"],
+                       {"locations": locations(beat, by_id, pos)})
+        except Exception:
+            pass
+
+
+def cmd_identify(lid):
+    if not re.fullmatch(r"[0-9a-f-]{8,64}", lid):
+        fail("No such light")
+    br = bridge()
+    try:
+        br.req("PUT", "light/" + lid, {"identify": {"action": "identify"}})
+    except Exception as exc:
+        fail("Couldn't reach the light (%s)" % str(exc)[:100])
+    emit(event="identified", id=lid)
+
+
+def cmd_forget():
+    if os.path.exists(RESTORE):
+        # Lights still out on loan: put them back before the keys go.
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psywall-hue")
+        subprocess.run([sys.executable, here, "--restore"], timeout=30)
+    for p in (huelib.CONF, huelib.LIGHTS):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+    emit(event="forgotten")
+
+
+def main():
+    a = sys.argv[1:]
+    cmds = {"discover": (cmd_discover, 0), "probe": (cmd_probe, 1), "pair": (cmd_pair, 1),
+            "inventory": (cmd_inventory, 0), "apply": (cmd_apply, 1), "move": (cmd_move, 3),
+            "identify": (cmd_identify, 1), "forget": (cmd_forget, 0)}
+    if not a or a[0] not in cmds or len(a) - 1 < cmds[a[0]][1]:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    try:
+        cmds[a[0]][0](*a[1:])
+    except huelib.PinMismatch:
+        fail("This bridge's certificate changed since pairing. Pair again.", code="pin")
+    except huelib.BridgeError as exc:
+        fail("The bridge said: %s" % str(exc)[:160])
+    except (OSError, ValueError) as exc:
+        fail("Couldn't reach the bridge (%s)" % str(exc)[:120], code="unreachable")
+
+
+if __name__ == "__main__":
+    main()

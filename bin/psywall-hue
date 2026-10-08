@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+"""psywall-hue — plays the psywall audio feed on the house's Hue lights.
+
+Reads psywall-audio's A lines on stdin (the shell plugin forwards them) and,
+while music is playing, drives every colour light on the bridge. It follows
+music only, never the microphone. After IDLE_STOP s without music it lets go
+and every light goes back to how it was.
+
+What the lights do comes from the Director (below): palettes spread across
+the room, each light's own slow drift, the beat handed from light to light
+(never the whole room at once), melody / hi-hat accents dealt out to a few
+lights at a time, a fine reading of the song's energy (intensity, tension),
+and a few rationed aggressive moments (hits, releases, bursts).
+
+Two paths, because a bridge streams at most 10 lights, one area at a time:
+  - the "beat" lights, in the entertainment area chosen at setup: the Hue
+    Entertainment API, DTLS 1.2 PSK in-process through libssl (huelib), RATE
+    frames/s, so these follow the beat.
+  - the "glow" lights: the regular API, on their own thread over one
+    kept-alive connection. A bridge request takes 230-370 ms, so these must
+    never share a loop with the stream (they used to, and it froze the stream
+    at ~3 frames/s: square steps instead of curves). Each fade lasts
+    SIDE_FADE, longer than one round of updates, so the bulbs glide
+    continuously from target to target.
+The state of every light touched is saved first (to RESTORE) and put back
+afterwards by a detached restorer, `psywall-hue --restore`: the bridge's own
+hand-back after streaming is unreliable, and the shell kills this process
+within moments of switching it off, long before 13 bridge requests finish.
+Lights that weren't chosen at setup, and white-only lights, are never
+touched. Only one instance holds the lights at a time (flock on LOCK), so a
+restart mid-song can't save the outgoing instance's colours as the
+"original" state.
+
+Pairing, the room and where each light stands: bin/psywall-hue-setup, driven
+from the psywall pane. Credentials ~/.config/psywall/hue.json (0600, see
+huelib); the room ~/.config/psywall/lights.json.
+stdin: A lines, `strength <0..2>`, `aggression <0..2>` (0 = no big moments,
+1 = default, 2 = wild) and `layout` (lights.json changed: lights moved). EOF lets go of the lights and exits.
+stdout: S <state> lines (streaming ..., stopped, unpaired, error ...), and I <json> lines
+for the psywall view: {"layout": [...]} at each stream start, the show's state
+(Director.info()) 10 times a second while streaming, {"stopped": true} at the end.
+"""
+
+import colorsys
+import ctypes
+import fcntl
+import json
+import math
+import os
+import random
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import huelib  # noqa: E402
+
+LEGACY_AREA = "Psywall House"   # pairings made before setup chose an area
+RATE = 50
+SIDE_FADE = 0.75    # s per side-light fade; > one round of updates, so fades overlap
+IDLE_STOP = 5.0     # s without music before the lights are handed back
+RETRY = 30.0        # s between attempts when the bridge is unreachable or busy
+HANDSHAKE = 5.0     # s allowed for the DTLS handshake
+PR_SET_PDEATHSIG = 1
+LOCK = os.path.join(huelib.CONF_DIR, "hue.lock")
+BUSY_RETRY = 3.0    # s, while another instance is still handing the lights back
+RESTORE = os.path.join(huelib.CONF_DIR, "hue-restore.json")
+QUICK_RETRY = 3.0   # s; the first few retries after a failure come fast
+
+
+class Busy(RuntimeError):
+    """Another psywall-hue holds the lights."""
+
+
+def set_pdeathsig(sig):
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0)
+    except OSError:
+        pass
+
+
+def say(text):
+    # One line, always: text can carry a bridge's own error message, and a
+    # newline in it would start a line of the protocol the plugin reads.
+    text = " ".join(str(text).split())[:300]
+    try:
+        sys.stdout.write("S " + text + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        raise SystemExit(0)
+
+
+def tell(obj):
+    """An I line: show state for the psywall view."""
+    try:
+        sys.stdout.write("I " + json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        raise SystemExit(0)
+
+
+def rgb_to_xy(r, g, b):
+    """sRGB 0..1 -> CIE xy; the bridge clamps it to each bulb's gamut."""
+    lin = lambda c: ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+    r, g, b = lin(r), lin(g), lin(b)
+    X = r * 0.4124 + g * 0.3576 + b * 0.1805
+    Y = r * 0.2126 + g * 0.7152 + b * 0.0722
+    Z = r * 0.0193 + g * 0.1192 + b * 0.9505
+    s = X + Y + Z
+    return (0.3127, 0.3290) if s <= 0 else (X / s, Y / s)
+
+
+# ---- the show ----------------------------------------------------------------
+#
+# Director: orchestrated light show for psywall-hue (offline prototype).
+#
+# The one rule: the room never pumps together. No layer moves every light at
+# once — a room that brightens and dims in lockstep reads as a toy. The
+# exceptions are a few rationed, earned moments of aggression.
+#
+# Per light, every frame:
+#   drift    its own slow brightness and colour motion, on its own periods
+#            (DRIFT_B / DRIFT_C, randomised per light), so the room is alive
+#            but no two lights move together
+#   beat     the beat is handed around, not pumped: each beat 1-2 lights take
+#            a soft pulse, picked by this phrase's beat style (walk / scatter /
+#            pairs / still); the bar's downbeat adds one more
+#   accents  melody / hi-hat onsets, dealt to a few lights at a time
+#
+# Reading the energy:
+#   intensity  0..1, where this moment sits among the last INTENSITY_WINDOW s of
+#              the same song (1 s loudness, percentile-ranked): a quiet song's
+#              chorus can reach 1. Accent size and density, beat pulse size
+#              and how many lights take the beat all follow it continuously.
+#   tension    0..1, rises while the energy climbs steadily (a build): the room
+#              holds its breath — base brightness dips, accents gather
+#   sections   breakdown / groove / peak, from phrase (8 s) against song (30 s)
+#              energy; they choose palettes and beat styles
+#
+# Aggressive moments, rationed by a heat budget (each costs heat; heat
+# recovers over HEAT_DECAY s, and a moment only fires if the budget allows):
+#   HIT      a sudden bass-heavy jump while intensity is high: 4-6 lights crack
+#            to near-white in a fast ripple and snap back
+#   RELEASE  the jump that ends a build (high tension) or a breakdown (a drop):
+#            a fresh palette and the whole room in a fast cascade
+#   BURST    a sustained climax: two bars of hard left/right alternation on the
+#            half-beat
+# Room-wide changes are staggered: a new palette sweeps across the room over
+# PAL_SWEEP s; hits and releases ripple CASCADE s apart per light.
+#
+# Accent taste rules:
+#   - weak accents get through with a probability and per-second cap that grow
+#     with intensity (and tension); strong ones (top 30% of recent) get one
+#     extra slot
+#   - glint (soft, one light), pop (1-2 lights, the palette's foil colour,
+#     strong accents only), blast (3-5 lights, only at high intensity, only
+#     the strongest, at least BLAST_GAP apart)
+#   - a light rests COOLDOWN after firing; picks favour lights far from the
+#     last accent and lights that haven't fired for a while
+#   - every envelope has a raised-cosine attack: nothing snaps on
+# Tuned offline by replaying a tee'd recording and drawing every light over time.
+
+# (hue 0..1, saturation): two related hues + one foil used for pops.
+PALETTES = {
+    "ember":  [(0.00, 0.90), (0.07, 0.95), (0.92, 0.80)],   # red, amber / magenta
+    "ocean":  [(0.52, 0.85), (0.61, 0.90), (0.78, 0.70)],   # teal, blue / violet
+    "neon":   [(0.88, 0.90), (0.76, 0.85), (0.50, 0.85)],   # magenta, violet / cyan
+    "dusk":   [(0.45, 0.70), (0.68, 0.80), (0.12, 0.85)],   # sea-green, indigo / gold
+    "sunset": [(0.05, 0.90), (0.95, 0.75), (0.80, 0.80)],   # orange, rose / purple
+    "ice":    [(0.55, 0.45), (0.63, 0.60), (0.00, 0.00)],   # pale cyan, blue / white
+}
+FOR_SECTION = {
+    "breakdown": ["ocean", "ice", "dusk"],
+    "groove":    ["ocean", "dusk", "sunset", "ember", "neon"],
+    "peak":      ["neon", "ember", "sunset"],
+}
+STYLES = {    # how the beat is handed around
+    "breakdown": ["still", "still", "walk"],
+    "groove":    ["walk", "scatter", "pairs"],
+    "peak":      ["scatter", "pairs", "walk"],
+}
+BASE = {"breakdown": 0.14, "groove": 0.18, "peak": 0.22}         # resting brightness
+BASE_ENERGY = 0.18                                                # + phrase energy x this
+BEAT_PULSE = (0.08, 0.35)                                         # attack s, decay s
+
+ACCENTS = {   # amplitude, attack s, decay s, how many lights
+    "glint": (0.28, 0.06, 0.40, (1, 1)),
+    "pop":   (0.50, 0.05, 0.30, (1, 2)),
+    "blast": (0.90, 0.04, 0.55, (3, 5)),
+}
+DRIFT_B = (9.0, 23.0)   # s, range of each light's brightness drift period
+DRIFT_C = (14.0, 35.0)  # s, range of each light's colour drift period
+COOLDOWN = 0.35         # s a light rests after an accent
+BLAST_GAP = 8.0         # s between blasts
+PHRASE = 16             # beats
+PAL_FADE = 3.0          # s each light takes to cross-fade to a new palette...
+PAL_SWEEP = 2.0         # ...starting up to this much later across the room
+CASCADE = 0.03          # s between lights in a hit / release ripple
+WARMUP = 15.0           # s before sections and moments are called
+DROP_AFTER = 8.0        # s of breakdown a drop needs before it
+
+INTENSITY_WINDOW = 90.0  # s of the song each moment is ranked against
+BUILD_SPAN = 4.0         # s over which the energy's climb is measured
+BUILD_SLOPE = 0.035      # per s, a climb that counts as building
+HEAT_DECAY = 30.0        # s for the aggression budget to recover completely
+COST = {"HIT": 0.45, "RELEASE": 0.8, "BURST": 0.6}
+HIT_GAP = 10.0           # s between hits (and releases)
+HIT_JUMP = 0.12          # 0.3 s loudness over 1 s loudness that counts as an impact
+HIT_INTENSITY = 0.7      # a hit only lands in the loud part of the song
+RECOVERY = 8.0           # s after a big moment when rising energy isn't a build
+
+# Colour drivers: a few lights at a time take turns changing colour at a pace
+# set by the tempo (one colour cycle per bar) or by one part of the spectrum;
+# the rest keep their slow drift.
+DRIVERS = {
+    "breakdown": ["mids", "highs", "tempo"],
+    "groove":    ["tempo", "bass", "mids", "highs"],
+    "peak":      ["tempo", "bass", "highs", "bass"],
+}
+FEATURE_HOLD = (6.0, 16.0)   # s a light keeps its driver
+FEATURE_REST = 10.0          # s a light rests (back on drift) before it can be driven again
+PACE_GLIDE = 1.5             # s for a light's colour pace to settle on its new driver
+BURST_GAP = 30.0         # s between bursts
+CLIMAX_HOLD = 4.0        # s at top intensity before a burst
+
+
+def hsv(h, s, v=1.0):
+    return colorsys.hsv_to_rgb(h % 1.0, max(0.0, min(1.0, s)), v)
+
+
+def mix(a, b, t):
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+class Tempo:
+    """Beat tracker: the period from an onset-strength envelope, the phase
+    from the kicks.
+
+    A grid fitted to kicks alone can't tell a tempo from its half or double
+    (every kick lands on all three grids), so the old tracker flipped between
+    octaves and its lock kept collapsing. Here the envelope (kick flags, bass
+    rises, melody accents, binned at RATE_HZ over WINDOW s) is autocorrelated,
+    and each candidate period is scored with its multiples' support (a true
+    beat also repeats at 2 and 4 beats; a double-time guess doesn't line up
+    with the bar) under a broad prior around 115 bpm. The period then only
+    moves with hysteresis: small drifts are followed, an octave jump needs a
+    clearly better score for SWITCH_EVALS evaluations in a row, a new song's
+    tempo a little less."""
+
+    MIN_GAP = 0.2
+    RATE_HZ = 50
+    WINDOW = 12.0
+    EVAL_EVERY = 0.5
+    BPM_LO, BPM_HI = 60, 180
+    PRIOR, PRIOR_OCT = 0.52, 1.1        # s; prior width in octaves
+    SWITCH_EVALS, OCTAVE_MARGIN, NEW_MARGIN = 5, 1.3, 1.2
+    NEW_EVALS = 3
+    SLEW, PERIOD_GLIDE, CONF_GLIDE = 0.12, 0.5, 0.8
+
+    def __init__(self):
+        self.period = self.target_period = 0.5
+        self.phase = 0.0
+        self.debt = 0.0
+        self.conf = self.target_conf = 0.0
+        self.kicks = []
+        self.pending = None
+        self.last_kick = -1e9
+        self.beats = 0        # completed beats (phase wraps)
+        n = int(self.WINDOW * self.RATE_HZ)
+        self.env = [0.0] * n  # ring buffer of onset strength
+        self.pos = 0
+        self.bin_t = None
+        self.prev_bass = 0.0
+        self.next_eval = 0.0
+        self.challenger = None   # (lag, count)
+        self.have = 0            # bins filled
+
+    # ---- inputs ----
+    def kick(self, now):
+        if now - self.last_kick >= self.MIN_GAP:
+            self.last_kick = now
+            self.pending = now
+
+    def onset(self, bass, beat, accent, now):
+        rise = max(0.0, bass - self.prev_bass)
+        self.prev_bass = bass
+        v = (1.0 if beat else 0.0) + 2.0 * rise + 0.3 * accent
+        if self.bin_t is None:
+            self.bin_t = now
+        steps = int((now - self.bin_t) * self.RATE_HZ)
+        if steps > 0:
+            for _ in range(min(steps, len(self.env))):
+                self.pos = (self.pos + 1) % len(self.env)
+                self.env[self.pos] = 0.0
+                self.have = min(len(self.env), self.have + 1)
+            self.bin_t += steps / self.RATE_HZ
+        self.env[self.pos] = max(self.env[self.pos], v)
+
+    # ---- period ----
+    def _scores(self):
+        n = len(self.env)
+        e = self.env[self.pos + 1:] + self.env[:self.pos + 1]   # oldest first
+        e = e[n - self.have:]
+        m = sum(e) / max(1, len(e))
+        e = [x - m for x in e]
+        z = sum(x * x for x in e) or 1.0
+        lo = math.ceil(self.RATE_HZ * 60 / self.BPM_HI)
+        hi = math.floor(self.RATE_HZ * 60 / self.BPM_LO)
+        acf = {}
+
+        def ac(L):
+            if L not in acf:
+                acf[L] = sum(e[i] * e[i + L] for i in range(len(e) - L)) / z if L < len(e) else 0.0
+            return acf[L]
+        out = {}
+        for L in range(lo, hi + 1):
+            # the beat and its repeats at 2, 3 and 4 beats: a triplet or
+            # double-time alias lines up with the beat at some multiples but
+            # not all of them, so the true period collects the most support
+            v = ac(L) + 0.5 * ac(2 * L) + 0.33 * ac(3 * L) + 0.25 * ac(4 * L)
+            # ...but every multiple of a steady beat scores alike, so a period
+            # with strong repetition at half of it is really two beats
+            half = 0.5 * (ac(L // 2) + ac((L + 1) // 2))
+            v *= 1 - 0.7 * max(0.0, min(1.0, half / max(ac(L), 1e-6)))
+            p = L / self.RATE_HZ
+            w = math.exp(-0.5 * (math.log2(p / self.PRIOR) / self.PRIOR_OCT) ** 2)
+            out[L] = max(0.0, v) * w
+        return out, ac(0) or 1.0
+
+    def _evaluate(self):
+        if self.have < self.RATE_HZ * 6:
+            return
+        sc, _ = self._scores()
+        if not sc:
+            return
+        best = max(sc, key=sc.get)
+        cur = int(round(self.target_period * self.RATE_HZ))
+        # the current period's score, at its best nearby lag
+        near = [L for L in sc if abs(L - cur) <= max(1, cur // 25)]
+        cur_s = max((sc[L] for L in near), default=0.0)
+        top = sc[best]
+        # Lock: how far the winner stands out from every other tempo.
+        mean = sum(sc.values()) / len(sc)
+        # Measured: a clear beat stands 10-20x above the mean, an ambiguous
+        # one 4-8x.
+        self.target_conf = max(0.0, min(1.0, (top / max(mean, 1e-6) - 3.0) / 9.0))
+        if abs(best - cur) <= max(1, cur // 25):
+            self.challenger = None
+            # follow a small drift, refined between neighbouring lags
+            l1, l2 = sc.get(best - 1, 0.0), sc.get(best + 1, 0.0)
+            den = l1 - 2 * top + l2
+            frac = 0.5 * (l1 - l2) / den if den else 0.0
+            self.target_period = min(60 / self.BPM_LO, max(60 / self.BPM_HI,
+                                     (best + max(-0.5, min(0.5, frac))) / self.RATE_HZ))
+            return
+        ratio = best / max(1, cur)
+        octave = any(abs(ratio - r) < 0.06 for r in (0.5, 2.0, 1.5, 2 / 3))
+        margin = self.OCTAVE_MARGIN if octave else self.NEW_MARGIN
+        if top > margin * max(cur_s, 1e-6) or cur_s <= 0.0:
+            if self.challenger and abs(self.challenger[0] - best) <= 1:
+                self.challenger = (best, self.challenger[1] + 1)
+            else:
+                self.challenger = (best, 1)
+            if self.challenger[1] >= (self.SWITCH_EVALS if octave else self.NEW_EVALS):
+                self.target_period = best / self.RATE_HZ
+                self.challenger = None
+        else:
+            self.challenger = None
+
+    def step(self, dt, now):
+        """Advance; returns (new_beat, new_half_beat)."""
+        if now >= self.next_eval:
+            self.next_eval = now + self.EVAL_EVERY
+            self._evaluate()
+        self.period += (self.target_period - self.period) * (1 - math.exp(-dt / self.PERIOD_GLIDE))
+        paid = self.debt * (1 - math.exp(-dt / self.SLEW))
+        self.debt -= paid
+        before = self.phase
+        self.phase = (self.phase + dt / self.period + paid) % 1.0
+        wrapped = self.phase < before and before - self.phase > 0.5
+        half = before < 0.5 <= self.phase
+        if wrapped:
+            self.beats += 1
+        if self.pending is not None:
+            # Phase from the kicks: their mean position on the current grid.
+            t, self.pending = self.pending, None
+            self.kicks = [k for k in self.kicks if t - k < 8.0] + [t]
+            if len(self.kicks) >= 4:
+                p = self.period
+                c = sum(math.cos(2 * math.pi * k / p) for k in self.kicks)
+                s = sum(math.sin(2 * math.pi * k / p) for k in self.kicks)
+                want = (now / p - math.atan2(s, c) / (2 * math.pi)) % 1.0
+                self.debt = ((want - self.phase + 0.5) % 1.0) - 0.5
+        if now - self.last_kick > 2.0:
+            self.target_conf *= math.exp(-dt / 0.5)
+        self.conf += (self.target_conf - self.conf) * (1 - math.exp(-dt / self.CONF_GLIDE))
+        return wrapped, half
+
+
+class EventLog(deque):
+    """The show's event log; `total` counts every append, so readers can
+    tell what's new even after old entries have fallen off the end."""
+
+    def __init__(self, maxlen):
+        super().__init__(maxlen=maxlen)
+        self.total = 0
+
+    def append(self, item):
+        super().append(item)
+        self.total += 1
+
+
+class Director:
+    def __init__(self, lights=(), seed=None):
+        self.rng = random.Random(seed)
+        self.tempo = Tempo()
+        self.t = {"bass": 0.0, "mids": 0.0, "highs": 0.0, "level": 0.0}
+        self.e_fast = self.e_mid = self.e_build = self.e_phrase = self.e_song = 0.0
+        self.e_bass = self.e_mids = self.e_highs = 0.0
+        self.aggression = 1.0                 # 0 = no big moments, 1 = default, 2 = wild
+        self.start = None
+        self.section, self.section_since = "groove", 0.0
+        self.palette, self.prev_palette, self.pal_at, self.pal_sweep = "ocean", "ocean", -1e9, PAL_SWEEP
+        self.style = "walk"
+        self.walker = 0
+        # energy reading
+        self.hist = deque(maxlen=int(INTENSITY_WINDOW * 10))   # 1 s loudness, 10 samples/s
+        self.next_hist = 0.0
+        self.intensity = 0.0
+        self.build = deque()                  # (time, 2 s loudness) over BUILD_SPAN
+        self.tension = 0.0
+        self.tension_mem = 0.0                # recent tension: releases land as a climb flattens
+        self.climax_since = None
+        # aggression
+        self.heat = 0.0
+        self.last_hit = -1e9
+        self.last_burst = -1e9
+        self.burst_until = -1e9
+        self.burst_side = 0
+        # accents
+        self.last_accent_x = 0.0
+        self.last_blast = -1e9
+        self.recent = deque()                 # times of accents that got through (last 1 s)
+        self.strengths = deque(maxlen=60)     # recent raw accent strengths
+        self.presence = 1.0
+        self.strength = 1.0
+        self.log = EventLog(100000)           # (time, event)
+        self.log_seen = 0                     # log.total at the last info() call
+        self.configure(lights)
+
+    def configure(self, lights):
+        """lights: [{x, y, fast, role}]. fast = streamed (slow ones only
+        follow the drift and palette). role, chosen per light in the pane:
+          beat     takes the rhythm: beat pulses in turn every beat, accents
+                   first, a darker resting level so the hits stand out
+          dynamic  the Director's mix: drift, a turn on the beat, accents,
+                   colour drivers (the default)
+          glow     ambient: palette and slow drift only, no beats or moments"""
+        self.L = list(lights)
+        self.n = len(self.L)
+        # Order across the room: palette spread, the beat walker, sweeps and
+        # ripples all use it. (Raw x repeats between lights.)
+        self.order = sorted(range(self.n), key=lambda i: (self.L[i]["x"], self.L[i]["y"]))
+        self.rank = [0.0] * self.n
+        for r, i in enumerate(self.order):
+            self.rank[i] = r / max(1, self.n - 1)
+        rnd = self.rng
+        self.drift_b = [(rnd.uniform(*DRIFT_B), rnd.uniform(0, 2 * math.pi)) for _ in range(self.n)]
+        self.drift_c = [(rnd.uniform(*DRIFT_C), rnd.uniform(0, 2 * math.pi)) for _ in range(self.n)]
+        # colour motion: each light's own phase, advancing at its own pace
+        self.cphase = [p for _, p in self.drift_c]
+        self.pace = [2 * math.pi / per for per, _ in self.drift_c]
+        self.swing = [0.18] * self.n
+        self.driver = ["drift"] * self.n
+        self.driver_until = [0.0] * self.n
+        self.featured_at = [-1e9] * self.n
+        self.acc = [None] * self.n            # accent: (t0, amp, attack, decay, rgb)
+        self.pulse = [None] * self.n          # beat pulse: (t0, amp, attack, decay)
+        self.last_used = [-1e9] * self.n
+        self._roles()
+        self.beat_turn = 0
+        self.out = [(0.0, 0.0, 0.0)] * self.n
+
+    def _roles(self):
+        role = lambda i: self.L[i].get("role", "dynamic")
+        # Lights that take part in beats, accents and big moments.
+        self.fast = [i for i in self.order if self.L[i]["fast"] and role(i) != "glow"]
+        self.beaters = [i for i in self.fast if role(i) == "beat"]
+        self.dynamic = [i for i in self.fast if role(i) == "dynamic"]
+        self.is_beat = [role(i) == "beat" for i in range(self.n)]
+
+    def place(self, xy):
+        """Lights moved (the pane's room map): new places, same lights, and the
+        show carries on — only the room order the sweeps follow changes."""
+        for i, (x, y) in enumerate(xy[:self.n]):
+            self.L[i]["x"], self.L[i]["y"] = x, y
+        self.order = sorted(range(self.n), key=lambda i: (self.L[i]["x"], self.L[i]["y"]))
+        for r, i in enumerate(self.order):
+            self.rank[i] = r / max(1, self.n - 1)
+        self._roles()
+
+    def info(self):
+        """What the show is doing right now, for the psywall view, with the
+        events logged since the previous call (accents by kind only)."""
+        new = self.log.total - self.log_seen
+        self.log_seen = self.log.total
+        events = [e for _, e in list(self.log)[-new:]] if new else []
+        events = [e.split()[0] if e.split()[0] in ("glint", "pop", "blast") else e
+                  for e in events if not e.startswith("drive ")]
+        return {
+            "section": self.section,
+            "intensity": round(self.intensity, 3),
+            "tension": round(self.tension, 3),
+            "heat": round(self.heat, 3),
+            "palette": self.palette,
+            "palette_rgb": [[round(c, 3) for c in hsv(h, s)] for h, s in PALETTES[self.palette]],
+            "style": self.style,
+            "bpm": round(60 / self.tempo.period),
+            "conf": round(self.tempo.conf, 2),
+            "lights": [[round(c, 3) for c in rgb] for rgb in self.out],
+            "drivers": list(self.driver),
+            "aggression": round(max(0.0, min(2.0, self.aggression)), 2),
+            "events": events,
+        }
+
+    # ---- inputs --------------------------------------------------------------
+    def feed(self, bass, mids, highs, level, beat, accent, now):
+        self.t.update(bass=bass, mids=mids, highs=highs, level=level)
+        self.tempo.onset(bass, beat, accent, now)
+        if beat:
+            self.tempo.kick(now)
+        if accent > 0 and self.fast:
+            self._accent(accent, now)
+
+    # ---- structure -------------------------------------------------------------
+    def _classify(self):
+        r = self.e_phrase / max(self.e_song, 0.05)
+        if r < 0.8 or self.tempo.conf < 0.2:
+            return "breakdown"
+        if r > 1.08 and self.tempo.conf > 0.35:
+            return "peak"
+        return "groove"
+
+    def _set_section(self, section, now):
+        self.section, self.section_since = section, now
+        self.log.append((now, "section " + section))
+
+    def _new_palette(self, section, now, sweep=PAL_SWEEP):
+        choices = [p for p in FOR_SECTION[section] if p != self.palette]
+        self.prev_palette, self.palette, self.pal_at = self.palette, self.rng.choice(choices), now
+        self.pal_sweep = sweep
+        self.pal_dir = self.rng.choice((1, -1))        # which side the sweep starts from
+        self.log.append((now, "palette " + self.palette))
+
+    def _new_style(self, section, now):
+        choices = [s for s in STYLES[section] if s != self.style] or STYLES[section]
+        self.style = self.rng.choice(choices)
+        self.log.append((now, "style " + self.style))
+
+    def _phrase(self, now):
+        section = self._classify()
+        if section != self.section:
+            self._set_section(section, now)
+            self._new_palette(section, now)
+            self._new_style(section, now)
+            return
+        if self.rng.random() < 0.5:           # keep some phrases the same: variety, not chaos
+            self._new_style(section, now)
+        if self.rng.random() < 0.3:
+            self._new_palette(section, now)
+
+    # ---- reading the energy ----------------------------------------------------
+    def _read_energy(self, dt, now):
+        lvl = self.t["level"]
+        self.e_fast += (lvl - self.e_fast) * (1 - math.exp(-dt / 0.3))
+        self.e_mid += (lvl - self.e_mid) * (1 - math.exp(-dt / 1.0))
+        self.e_build += (lvl - self.e_build) * (1 - math.exp(-dt / 2.0))
+        self.e_phrase += (lvl - self.e_phrase) * (1 - math.exp(-dt / 8.0))
+        self.e_song += (lvl - self.e_song) * (1 - math.exp(-dt / 30.0))
+        kb = 1 - math.exp(-dt / 0.4)
+        self.e_bass += (self.t["bass"] - self.e_bass) * kb
+        self.e_mids += (self.t["mids"] - self.e_mids) * kb
+        self.e_highs += (self.t["highs"] - self.e_highs) * kb
+        if now >= self.next_hist:
+            self.hist.append(self.e_mid)
+            self.next_hist = now + 0.1
+        rank = sum(1 for v in self.hist if v <= self.e_mid) / max(1, len(self.hist))
+        self.intensity += (rank - self.intensity) * (1 - math.exp(-dt / 0.5))
+        self.build.append((now, self.e_build))
+        while self.build and now - self.build[0][0] > BUILD_SPAN:
+            self.build.popleft()
+        span = now - self.build[0][0]
+        slope = (self.e_build - self.build[0][1]) / span if span > 1.0 else 0.0
+        # energy coming back after a big moment is recovery, not a build
+        recovering = now - self.last_hit < RECOVERY
+        if slope > BUILD_SLOPE and self.intensity > 0.35 and not recovering:
+            self.tension = min(1.0, self.tension + dt / 6.0)    # a build: ~6 s to full tension
+        else:
+            self.tension = max(0.0, self.tension - dt / 2.5)
+        self.tension_mem = max(self.tension, self.tension_mem * math.exp(-dt / 2.0))
+        self.heat = max(0.0, self.heat - dt / HEAT_DECAY)
+
+    def _cost(self, kind):
+        # more aggression makes each moment cheaper, less makes it dearer
+        return COST[kind] / max(0.25, min(2.0, self.aggression))
+
+    def _affords(self, kind):
+        return self.heat + self._cost(kind) <= 1.0
+
+    def _ripple(self, now, amp, att, dec, rgb, lights=None):
+        seq = lights if lights is not None else self.fast
+        if self.rng.random() < 0.5:
+            seq = seq[::-1]
+        for k, i in enumerate(seq):
+            self.acc[i] = (now + k * CASCADE, amp, att, dec, rgb)
+            self.last_used[i] = now
+
+    def _hit(self, now):
+        self.heat += self._cost("HIT")
+        self.last_hit = now
+        count = min(len(self.fast), self.rng.randint(4, 6))
+        picks = sorted(self.rng.sample(self.fast, count), key=lambda i: self.rank[i])
+        self._ripple(now, 1.0, 0.02, 0.25, mix(self._pal_rgb(2), (1, 1, 1), 0.6), picks)
+        self.log.append((now, "HIT"))
+
+    def _release(self, now, why):
+        self.heat += self._cost("RELEASE")
+        self.last_hit = now
+        self.tension = self.tension_mem = 0.0
+        self._set_section("peak", now)
+        self._new_palette("peak", now, sweep=0.4)
+        self.style = "scatter"
+        self._ripple(now, 1.0, 0.02, 0.6, mix(self._pal_rgb(2), (1, 1, 1), 0.45))
+        self.log.append((now, "RELEASE " + why))
+
+    def _burst(self, now):
+        self.heat += self._cost("BURST")
+        self.last_burst = now
+        self.burst_until = now + 8 * self.tempo.period            # two bars
+        self.log.append((now, "BURST"))
+
+    def _moments(self, now):
+        a = max(0.0, min(2.0, self.aggression))
+        if now - self.start <= WARMUP or a <= 0.01:
+            return                            # aggression 0: no big moments at all
+        g = max(a, 0.25)
+        jump = self.e_fast - self.e_mid
+        # aggression lowers the bar (a smaller jump, a less intense moment) and shortens the gaps
+        if (jump > HIT_JUMP * (1.4 - 0.4 * a) and self.t["bass"] > 0.6
+                and now - self.last_hit > HIT_GAP / g):
+            if self.tension_mem > 0.5 and self._affords("RELEASE"):
+                self._release(now, "build")
+            elif (self.section == "breakdown" and now - self.section_since > DROP_AFTER
+                  and self._affords("RELEASE")):
+                self._release(now, "drop")
+            elif self.intensity > HIT_INTENSITY - 0.15 * (a - 1) and self._affords("HIT"):
+                self._hit(now)
+        if (self.intensity > 0.9 - 0.05 * (a - 1) and self.section != "breakdown"
+                and self.tempo.conf > 0.4):
+            if self.climax_since is None:
+                self.climax_since = now
+            elif (now - self.climax_since > CLIMAX_HOLD and now - self.last_burst > BURST_GAP / g
+                  and self._affords("BURST")):
+                self._burst(now)
+        else:
+            self.climax_since = None
+
+    # ---- colour drivers --------------------------------------------------------
+    def _drivers(self, dt, now):
+        """A few lights at a time take turns changing colour at a pace set by
+        the tempo or one part of the spectrum; the rest keep their drift."""
+        for i in self.dynamic:
+            if self.driver[i] != "drift" and now >= self.driver_until[i]:
+                self.driver[i] = "drift"
+                self.featured_at[i] = now
+        busy = sum(1 for i in self.dynamic if self.driver[i] != "drift")
+        want = 1 + int(round(3 * self.intensity))
+        if self.section == "breakdown":
+            want = min(want, 2)
+        if busy < want and self.rng.random() < dt * 0.6:     # a light joins every ~2 s at most
+            rested = [i for i in self.dynamic if self.driver[i] == "drift" and now - self.featured_at[i] > FEATURE_REST]
+            if rested:
+                i = min(rested, key=lambda k: self.featured_at[k])       # whoever has waited longest
+                used = [self.driver[k] for k in self.dynamic]
+                pick = min(DRIVERS[self.section], key=lambda d: (used.count(d), self.rng.random()))
+                self.driver[i] = pick
+                self.driver_until[i] = now + self.rng.uniform(*FEATURE_HOLD)
+                self.log.append((now, "drive %d %s" % (i, pick)))
+        # each light's colour pace glides toward what its driver asks for
+        k = 1 - math.exp(-dt / PACE_GLIDE)
+        for i in range(self.n):
+            base = 2 * math.pi / self.drift_c[i][0]
+            d = self.driver[i]
+            if d == "tempo":
+                target, swing = 2 * math.pi / (4 * self.tempo.period), 0.32    # one colour cycle per bar
+            elif d == "bass":
+                target, swing = base * (1 + 14 * self.e_bass), 0.28
+            elif d == "mids":
+                target, swing = base * (1 + 10 * self.e_mids), 0.28
+            elif d == "highs":
+                target, swing = base * (1 + 18 * self.e_highs), 0.28
+            else:
+                target, swing = base, 0.18
+            self.pace[i] += (target - self.pace[i]) * k
+            self.swing[i] += (swing - self.swing[i]) * k
+            self.cphase[i] += self.pace[i] * dt
+
+    # ---- the beat, handed around ---------------------------------------------------
+    def _beat(self, now):
+        if self.tempo.conf < 0.3:
+            return
+        att, dec = BEAT_PULSE
+        # Beat lights: every beat, in turn — one at a time (two on a bar's
+        # downbeat at high intensity), so even a room of them never pumps as one.
+        if self.beaters:
+            downbeat = self.tempo.beats % 4 == 0
+            if self.style == "still" and not downbeat:
+                pass                                    # a breakdown: downbeats only
+            else:
+                count = 1 + (1 if downbeat and self.intensity > 0.6 and len(self.beaters) > 2 else 0)
+                amp = (0.3 + 0.4 * self.intensity) * (0.5 if self.style == "still" else 1.0)
+                for k in range(count):
+                    i = self.beaters[self.beat_turn % len(self.beaters)]
+                    self.beat_turn += 1 if len(self.beaters) < 3 else self.rng.choice((1, 1, 2))
+                    self.pulse[i] = (now + k * 0.03, amp, att * 0.7, dec)
+                    self.last_used[i] = now
+        if self.style == "still" or not self.dynamic:
+            return
+        pool_all = self.dynamic
+        count = 1 + (1 if self.intensity > 0.7 else 0) + (1 if self.tempo.beats % 4 == 0 else 0)
+        if self.tension > 0.5:
+            count += 1
+        m = len(pool_all)
+        if self.style == "walk":                        # a light-to-light walk across the room
+            self.walker = (self.walker + self.rng.choice((1, 1, 2, -1))) % m
+            picks = [pool_all[(self.walker + k) % m] for k in range(min(count, m))]
+        elif self.style == "pairs":                     # mirrored pairs from the two ends
+            self.walker = (self.walker + 1) % ((m + 1) // 2)
+            picks = list(dict.fromkeys([pool_all[self.walker], pool_all[m - 1 - self.walker]]))
+        else:                                           # scatter: not recently used
+            pool = sorted(pool_all, key=lambda i: self.last_used[i])[: max(count, m // 2)]
+            picks = self.rng.sample(pool, min(count, len(pool)))
+        amp = 0.18 + 0.22 * self.intensity
+        for i in picks:
+            self.pulse[i] = (now, amp, att, dec)
+
+    def _burst_step(self, now):
+        """Half-beat left/right alternation during a burst."""
+        side = self.burst_side
+        self.burst_side ^= 1
+        lights = [i for i in self.fast if (self.rank[i] < 0.5) == (side == 0)]
+        rgb = mix(self._pal_rgb(2), (1, 1, 1), 0.3)
+        for i in lights:
+            self.acc[i] = (now, 0.75, 0.02, 0.1, rgb)
+            self.last_used[i] = now
+
+    # ---- accents ---------------------------------------------------------------
+    def _pal_rgb(self, k):
+        h, s = PALETTES[self.palette][k]
+        return hsv(h, s)
+
+    def _accent(self, s, now):
+        self.strengths.append(s)
+        while self.recent and now - self.recent[0] > 1.0:
+            self.recent.popleft()
+        if now < self.burst_until:
+            return                            # the burst owns the room
+        ranked = sorted(self.strengths)
+        strong = s >= ranked[int(0.7 * (len(ranked) - 1))]
+        keep = 0.3 + 0.5 * self.intensity + 0.2 * self.tension
+        cap = 1 + int(3 * self.intensity + 2 * self.tension)
+        if len(self.recent) >= cap + (1 if strong else 0):
+            return                            # strong accents get one extra slot, no more
+        if not strong and self.rng.random() > keep:
+            return
+        if (self.intensity > 0.8 and s > 0.9 and s >= ranked[int(0.9 * (len(ranked) - 1))]
+                and self.aggression > 0.01 and now - self.last_blast > BLAST_GAP / max(0.25, self.aggression)):
+            kind = "blast"
+            self.last_blast = now
+        elif self.section != "breakdown" and s > 0.55 and s >= ranked[int(0.6 * (len(ranked) - 1))]:
+            kind = "pop"
+        else:
+            kind = "glint"
+        amp, att, dec, (lo, hi) = ACCENTS[kind]
+        cands = [i for i in self.fast if now - self.last_used[i] > COOLDOWN]
+        if not cands:
+            return
+        count = min(len(cands), self.rng.randint(lo, hi))
+        picks = []
+        for _ in range(count):
+            w = [(abs(self.L[i]["x"] - self.last_accent_x) + 0.3) * (1 + min(3.0, now - self.last_used[i]))
+                 * (2.0 if self.is_beat[i] else 1.0) for i in cands]
+            i = self.rng.choices(cands, weights=w)[0]
+            cands.remove(i)
+            picks.append(i)
+        scale = (0.6 + 0.6 * self.intensity) * (0.7 + 0.3 * s)
+        for k, i in enumerate(picks):
+            if kind == "blast":
+                rgb = mix(self._pal_rgb(2), (1, 1, 1), 0.35)
+            elif kind == "pop":
+                rgb = self._pal_rgb(2)
+            else:
+                rgb = mix(self._base_rgb(i, now), (1, 1, 1), 0.3)   # a brighter shade of its own colour
+            # lights in one accent land a few ms apart, never as one block
+            self.acc[i] = (now + k * 0.03, min(1.0, amp * scale), att, dec, rgb)
+            self.last_used[i] = now
+        self.last_accent_x = sum(self.L[i]["x"] for i in picks) / len(picks)
+        self.recent.append(now)
+        self.log.append((now, kind + " " + ",".join(str(i) for i in picks)))
+
+    @staticmethod
+    def _env(e, now):
+        t0, amp, att, dec = e[:4]
+        u = now - t0
+        if u < 0:
+            return 0.0, False
+        if u < att:
+            return amp * 0.5 * (1 - math.cos(math.pi * u / att)), False
+        v = amp * math.exp(-(u - att) / dec)
+        return v, v < 0.005
+
+    # ---- per light -------------------------------------------------------------
+    def _base_rgb(self, i, now):
+        u = (self.rank[i] + self.swing[i] * math.sin(self.cphase[i])) % 1.0
+
+        def spread(name):
+            cols = PALETTES[name][:2] + [PALETTES[name][0]]
+            k = u * 2
+            j = min(1, int(k))
+            (h1, s1), (h2, s2) = cols[j], cols[j + 1]
+            dh = ((h2 - h1 + 0.5) % 1.0) - 0.5
+            f = k - j
+            return hsv(h1 + dh * f, s1 + (s2 - s1) * f)
+
+        # each light starts its crossfade a little later: the change sweeps the room
+        order = self.rank[i] if getattr(self, "pal_dir", 1) > 0 else 1 - self.rank[i]
+        f = (now - self.pal_at - self.pal_sweep * order) / PAL_FADE
+        f = min(1.0, max(0.0, f))
+        return mix(spread(self.prev_palette), spread(self.palette), f)
+
+    def step(self, dt, now, wanted=True):
+        """Advance one frame; the colours land in self.out (one rgb per light)."""
+        if self.start is None:
+            self.start = now
+        target = 1.0 if wanted else 0.0
+        self.presence += max(-dt * 0.6, min(dt * 0.7, target - self.presence))
+        self._read_energy(dt, now)
+        self._moments(now)
+        beat, half = self.tempo.step(dt, now)
+        if beat:
+            if self.tempo.beats % PHRASE == 0 and now - self.start > WARMUP:
+                self._phrase(now)
+            if now >= self.burst_until:
+                self._beat(now)
+        if now < self.burst_until and (beat or half):
+            self._burst_step(now)
+
+        self._drivers(dt, now)
+
+        # the room holds its breath during a build
+        base = (BASE[self.section] + BASE_ENERGY * self.e_phrase) * (1 - 0.35 * self.tension)
+        out = []
+        for i, l in enumerate(self.L):
+            period, phase = self.drift_b[i]
+            b = base * (0.7 + 0.45 * (0.5 + 0.5 * math.sin(2 * math.pi * now / period + phase)))
+            if self.is_beat[i]:
+                b *= 0.6                                 # darker at rest: the beats stand out
+            col = self._base_rgb(i, now)
+            if l["fast"]:
+                if self.pulse[i] is not None:
+                    v, done = self._env(self.pulse[i], now)
+                    b += v
+                    if done:
+                        self.pulse[i] = None
+                if self.acc[i] is not None:
+                    v, done = self._env(self.acc[i], now)
+                    col = mix(col, self.acc[i][4], min(1.0, v * 1.6))
+                    b += v
+                    if done:
+                        self.acc[i] = None
+            b = min(1.0, b) * self.presence * self.strength
+            out.append(tuple(c * b for c in col))
+        self.out = out
+        return out
+
+
+# ---- the lights -----------------------------------------------------------------
+
+
+class SideLights(threading.Thread):
+    """Round-robin fades for the glow lights, off the stream's loop, over one
+    kept-alive HTTPS connection of their own (a fresh TLS handshake per
+    request costs the bridge ~350 ms; a reused one ~230). Each reads its
+    colour from the director's latest frame (slot `first + i`)."""
+
+    def __init__(self, conf, ids, show, first):
+        super().__init__(daemon=True)
+        self.b = huelib.Bridge(conf)   # its own connection: never shared across threads
+        self.ids = ids
+        self.show = show
+        self.first = first
+        self.done = threading.Event()
+
+    def run(self):
+        n = 0
+        while self.ids and not self.done.is_set():
+            i = n % len(self.ids)
+            n += 1
+            out = self.show.out
+            r, g, b = out[self.first + i] if self.first + i < len(out) else (0.0, 0.0, 0.0)
+            peak = max(r, g, b)
+            x, y = rgb_to_xy(r / peak, g / peak, b / peak) if peak > 0 else (0.3127, 0.3290)
+            body = {"on": {"on": True}, "dimming": {"brightness": max(1.0, min(100.0, peak * 100))},
+                    "color": {"xy": {"x": round(x, 4), "y": round(y, 4)}},
+                    "dynamics": {"duration": int(SIDE_FADE * 1000)}}
+            try:
+                self.b.raw("PUT", "/clip/v2/resource/light/" + self.ids[i], body, timeout=2)
+            except Exception:
+                self.b.close()
+                self.done.wait(1.0)
+            self.done.wait(0.05)   # stays under the regular API's ~10 commands/s
+        self.b.close()
+
+    def finish(self):
+        self.done.set()
+        if self.ident is not None:   # it may never have been started
+            self.join(timeout=0.5)   # daemon thread; never hold up the hand-back
+
+
+def light_room(br, lights_by_id, area):
+    """lights.json for a pairing made before the setup screens existed (the
+    area named LEGACY_AREA, every other colour light glowing), so the pane can
+    draw the room it streams."""
+    ents = {e["id"]: (e.get("renderer_reference") or {}).get("rid") for e in br.req("GET", "entertainment")["data"]}
+    out, beat = [], set()
+    for c in area["channels"]:
+        lid = ents.get(c["members"][0]["service"]["rid"]) if c.get("members") else None
+        if lid in lights_by_id and lid not in beat:
+            beat.add(lid)
+            out.append({"id": lid, "name": lights_by_id[lid]["metadata"]["name"], "room": "",
+                        "x": c["position"]["x"], "y": c["position"]["y"], "mode": "dynamic", "live": True})
+    glow = [l for l in lights_by_id.values() if l.get("color") and l["id"] not in beat]
+    for k, l in enumerate(glow):
+        out.append({"id": l["id"], "name": l["metadata"]["name"], "room": "",
+                    "x": round(-0.8 + 1.6 * k / max(1, len(glow) - 1), 3) if len(glow) > 1 else 0.0,
+                    "y": -0.85, "mode": "glow", "live": False})
+    return out
+
+
+class Lights:
+    def __init__(self, conf):
+        self.conf = conf
+        self.b = huelib.Bridge(conf)
+        self.dtls = None
+        self.area_id = ""
+        self.channels = []   # channel ids, in the director's light order
+        self.order = []      # light id per director slot (beat lights, then glow)
+        self.side = []       # glow light ids, driven through the regular API
+        self.sides = None    # SideLights thread
+        self.saved = {}      # light id -> state to put back
+        self.seq = 0
+        self.lock_fd = None
+        self.layout = []     # names and places of the director's lights, for the view
+        self.next_check = 0.0
+        self.flash = None    # (slot, until): a light blinking for the pane
+
+    @property
+    def active(self):
+        return self.dtls is not None
+
+    def start(self, show):
+        fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise Busy("another psywall-hue holds the lights")
+        self.lock_fd = fd
+        if os.path.exists(RESTORE):
+            restore_from_file()   # an earlier instance died before handing back
+        room = huelib.load_lights() or {}
+        areas = self.b.req("GET", "entertainment_configuration")["data"]
+        lights = {l["id"]: l for l in self.b.req("GET", "light")["data"]}
+        known = room.get("lights") or []
+        if room.get("area"):
+            area = next((a for a in areas if a["id"] == room["area"]), None)
+            if area is None:
+                raise RuntimeError("the entertainment area chosen at setup is gone; run Hue setup again")
+        elif known and all(l.get("id") for l in known):
+            area = None   # glow lights only
+        else:
+            area = next((a for a in areas if a["metadata"]["name"] == LEGACY_AREA), None)
+            if area is None:
+                raise RuntimeError("no lights chosen yet; open the psywall pane and set up your lights")
+            room["area"], room["areaName"] = area["id"], LEGACY_AREA
+            room["lights"] = light_room(self.b, lights, area)
+            # Places dragged before the ids were known (matched by name) win.
+            moved = {l.get("name"): l for l in known if "x" in l}
+            for l in room["lights"]:
+                if l["name"] in moved:
+                    l["x"], l["y"] = moved[l["name"]]["x"], moved[l["name"]]["y"]
+            huelib.save_lights(room)
+        if area is not None and area.get("status") == "active" and area.get("active_streamer"):
+            # Someone else (a Hue Sync app, a TV box) is streaming to it.
+            self.b.req("PUT", "entertainment_configuration/" + area["id"], {"action": "stop"})
+        self.area_id = area["id"] if area else ""
+        ents = {e["id"]: (e.get("renderer_reference") or {}).get("rid") for e in self.b.req("GET", "entertainment")["data"]}
+        chans = area["channels"] if area else []
+        self.channels = [c["channel_id"] for c in chans]
+        chan_light = [ents.get(c["members"][0]["service"]["rid"]) if c.get("members") else None for c in chans]
+        place = {l["id"]: l for l in room.get("lights", [])}
+        live_of = lambda l: l.get("live", l.get("mode") != "glow")   # files from before modes
+        role_of = lambda l: l.get("mode", "dynamic") if "live" in l else ("dynamic" if live_of(l) else "glow")
+        roles = {l["id"]: role_of(l) for l in room.get("lights", [])}
+        self.side = [l["id"] for l in room.get("lights", [])
+                     if not live_of(l) and l["id"] in lights and lights[l["id"]].get("color")]
+        self.order = chan_light + self.side
+        streamed = {s["rid"] for s in (area or {}).get("light_services", [])} | {i for i in chan_light if i}
+        self.saved = {lid: self._state(lights[lid]) for lid in streamed | set(self.side) if lid in lights}
+
+        def xy(k, lid, fallback):
+            p = place.get(lid)
+            return (float(p["x"]), float(p["y"])) if p and "x" in p else fallback
+        spots = [xy(k, lid, (c["position"]["x"], c["position"]["y"])) for k, (lid, c) in enumerate(zip(chan_light, chans))]
+        spots += [xy(k, lid, (-1.0 + 2.0 * k / max(1, len(self.side) - 1), -0.85)) for k, lid in enumerate(self.side)]
+        show.configure([{"x": x, "y": y, "fast": k < len(chans), "role": roles.get(lid, "dynamic")}
+                        for k, (lid, (x, y)) in enumerate(zip(self.order, spots))])
+        name = lambda lid: lights[lid]["metadata"]["name"] if lid in lights else "?"
+        self.layout = [{"name": name(lid), "x": x, "y": y, "fast": k < len(chans), "role": roles.get(lid, "dynamic")}
+                       for k, (lid, (x, y)) in enumerate(zip(self.order, spots))]
+        self._write_restore()
+
+        if area is not None:
+            self.b.req("PUT", "entertainment_configuration/" + self.area_id, {"action": "start"})
+            self.dtls = huelib.DTLSStream(self.b.host, self.b.user, self.b.key)
+            try:
+                self.dtls.handshake(HANDSHAKE)
+            except huelib.DTLSError:
+                self.dtls = None
+                raise
+        else:
+            self.dtls = NoStream()
+        self.next_check = time.monotonic() + 0.5
+        # Glow lights start once the session is up: the bridge's small CPU is
+        # slow at TLS, so it shouldn't do both at once.
+        self.sides = SideLights(self.conf, self.side, show, len(self.channels))
+        self.sides.start()
+        say("streaming %d live + %d slow" % (len(self.channels), len(self.side)))
+        tell({"layout": self.layout})
+
+    def relayout(self, show):
+        """lights.json changed while streaming: lights were moved."""
+        place = {l["id"]: l for l in (huelib.load_lights() or {}).get("lights", [])}
+        xy = []
+        for k, lid in enumerate(self.order):
+            p = place.get(lid)
+            cur = self.layout[k] if k < len(self.layout) else {"x": 0.0, "y": 0.0}
+            xy.append((float(p["x"]), float(p["y"])) if p and "x" in p else (cur["x"], cur["y"]))
+        show.place(xy)
+        for k, (x, y) in enumerate(xy):
+            if k < len(self.layout):
+                self.layout[k]["x"], self.layout[k]["y"] = x, y
+        tell({"layout": self.layout})
+
+    def identify(self, lid):
+        """The pane asked which light this is: while streaming, the show
+        itself blinks it white (a REST identify can't reach a light that is
+        streaming); otherwise the bridge's own identify."""
+        if lid in self.order and self.active:
+            self.flash = (self.order.index(lid), time.monotonic() + 2.4)
+            return
+        try:
+            self.b.req("PUT", "light/" + lid, {"identify": {"action": "identify"}})
+        except Exception:
+            pass
+
+    def overlay(self, show):
+        if not self.flash:
+            return
+        slot, until = self.flash
+        left = until - time.monotonic()
+        if left <= 0 or slot >= len(show.out):
+            self.flash = None
+            return
+        v = 1.0 if int(left / 0.4) % 2 == 0 else 0.0   # three blinks
+        show.out[slot] = (v, v, v)
+
+    def _write_restore(self):
+        # No credentials in here: the restorer reads hue.json itself.
+        job = {"bridge": self.b.addr, "area_id": self.area_id, "saved": self.saved}
+        huelib.save_json(job, RESTORE)
+
+    @staticmethod
+    def _state(light):
+        st = {"on": {"on": light["on"]["on"]}}
+        if light.get("dimming"):
+            st["dimming"] = {"brightness": light["dimming"]["brightness"]}
+        ct = light.get("color_temperature") or {}
+        if ct.get("mirek_valid") and ct.get("mirek"):
+            st["color_temperature"] = {"mirek": ct["mirek"]}
+        elif light.get("color"):
+            st["color"] = {"xy": light["color"]["xy"]}
+        return st
+
+    def frame(self, show):
+        """Send one frame (one DTLS record, one datagram); True while the
+        stream is flowing."""
+        if self.dtls is None:
+            return False
+        now = time.monotonic()
+        if now >= self.next_check:
+            self.next_check = now + 0.5
+            if self.dtls.closed():
+                raise RuntimeError("the bridge ended the stream")
+        if not self.channels:
+            return True
+        frame = bytearray(b"HueStream")
+        frame += bytes([2, 0, self.seq & 0xFF, 0, 0, 0, 0])   # v2.0, seq, reserved, RGB, reserved
+        frame += self.area_id.encode("ascii")
+        out = show.out
+        for idx, cid in enumerate(self.channels):
+            rgb = out[idx] if idx < len(out) else (0.0, 0.0, 0.0)
+            frame += struct.pack(">BHHH", cid, *(int(max(0.0, min(1.0, v)) * 65535) for v in rgb))
+        self.seq += 1
+        self.dtls.send(bytes(frame))
+        return True
+
+    def stop(self, reason="stopped"):
+        if self.sides is not None:
+            self.sides.finish()
+            self.sides = None
+        if self.dtls is not None:
+            try:
+                self.dtls.close()
+            except Exception:
+                pass
+            self.dtls = None
+        self.b.close()
+        # The hand-back runs detached, so being killed can't cut it short. The
+        # restorer inherits the flock: no new instance can snapshot the lights
+        # until they are really back.
+        if os.path.exists(RESTORE):
+            try:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "--restore", "--locked"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True,
+                                 pass_fds=(self.lock_fd,) if self.lock_fd is not None else ())
+            except OSError:
+                restore_from_file()
+        self.saved = {}
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)   # the restorer, if any, still holds the flock
+            self.lock_fd = None
+        say(reason)
+        tell({"stopped": True})
+
+
+class NoStream:
+    """Glow lights only: no entertainment area, nothing over DTLS."""
+
+    def closed(self):
+        return False
+
+    def send(self, data):
+        return True
+
+    def close(self):
+        pass
+
+
+def restore_from_file(path=RESTORE):
+    """Stop the area and put back every light saved in `path`, then delete it."""
+    try:
+        with open(path) as f:
+            job = json.load(f)
+        conf = huelib.load_conf()
+    except (OSError, ValueError, KeyError):
+        return
+    if job.get("bridge") and job["bridge"] != conf["bridge"]:
+        return   # paired with another bridge since: these lights aren't reachable
+    bridge = huelib.Bridge(conf)
+    if job.get("area_id"):
+        try:
+            bridge.req("PUT", "entertainment_configuration/" + job["area_id"], {"action": "stop"})
+        except Exception:
+            pass
+    bridge.close()
+    time.sleep(0.3)   # let the bridge finish its own hand-back first
+
+    def put(item):
+        lid, st = item
+        b = huelib.Bridge(conf)
+        for _ in range(2):
+            try:
+                b.req("PUT", "light/" + lid, dict(st, dynamics={"duration": 800}), timeout=3)
+                break
+            except Exception:
+                time.sleep(0.3)
+        b.close()
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3) as pool:   # ~3 in flight stays near the API's ~10/s
+        list(pool.map(put, job.get("saved", {}).items()))
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def main():
+    if sys.argv[1:2] == ["--restore"]:
+        # Detached hand-back. Started by a stopping instance it arrives holding
+        # that instance's flock (--locked); started by the shell after a hard
+        # kill it takes the lock itself, waiting out any restorer already busy.
+        if not os.path.exists(RESTORE):
+            return
+        if "--locked" not in sys.argv:
+            fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        restore_from_file()
+        return
+    set_pdeathsig(signal.SIGTERM)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        lights = Lights(huelib.load_conf())
+    except (OSError, ValueError, KeyError):
+        lights = None
+        say("unpaired")
+
+    show = Director()
+    last_music = -1e9
+    retry_at = 0.0
+    fails = 0          # consecutive failures; the first few retry quickly
+    last = time.monotonic()
+    next_frame = 0.0   # frames go out on a fixed 1/RATE cadence, not when input arrives
+    next_info = 0.0    # I lines for the psywall view, 10 per second while streaming
+    stdin_fd = sys.stdin.fileno()
+    buf = b""
+
+    def shutdown(*_):
+        if lights and lights.active:
+            lights.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    try:
+        while True:
+            streaming = lights is not None and lights.active
+            wait = max(0.0, next_frame - time.monotonic()) if streaming else 1.0
+            ready, _, _ = select.select([stdin_fd], [], [], wait)
+            now = time.monotonic()
+            if ready:
+                chunk = os.read(stdin_fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    p = raw.decode("utf-8", "replace").split()
+                    if len(p) >= 7 and p[0] == "A":   # an 8th field (melody accent) may follow
+                        accent = float(p[7]) if len(p) > 7 else 0.0
+                        show.feed(*(float(x) for x in p[1:5]), p[5] == "1", accent, now)
+                        if p[6] == "m" and float(p[4]) > 0.08:
+                            last_music = now
+                    elif len(p) == 2 and p[0] == "strength":
+                        show.strength = max(0.0, min(2.0, float(p[1])))
+                    elif len(p) == 2 and p[0] == "aggression":
+                        show.aggression = max(0.0, min(2.0, float(p[1])))
+                    elif p == ["layout"] and lights is not None and lights.active:
+                        lights.relayout(show)
+                    elif (len(p) == 2 and p[0] == "identify" and lights is not None
+                          and re.fullmatch(r"[0-9a-f-]{8,64}", p[1])):
+                        lights.identify(p[1])
+            if lights is None:
+                continue
+
+            wanted = now - last_music < IDLE_STOP
+            if wanted and not lights.active and now >= retry_at:
+                try:
+                    show.presence = 0.0
+                    lights.start(show)
+                except Busy:
+                    # Not ours: don't stop the other instance's stream.
+                    retry_at = now + BUSY_RETRY
+                except huelib.PinMismatch:
+                    lights.stop("error the bridge's certificate changed since pairing; pair again")
+                    retry_at = now + 600
+                except Exception as exc:
+                    lights.stop("error %s" % exc)
+                    retry_at = now + (QUICK_RETRY if fails < 3 else RETRY)
+                    fails += 1
+            if not lights.active or now < next_frame:
+                continue
+            next_frame += 1.0 / RATE
+            if next_frame < now:              # fell behind: reset rather than burst to catch up
+                next_frame = now + 1.0 / RATE
+            dt = min(0.1, now - last)
+            last = now
+            show.step(dt, now, wanted)
+            lights.overlay(show)
+            if not wanted and show.presence <= 0.0:
+                lights.stop()
+                continue
+            try:
+                if lights.frame(show):
+                    fails = 0
+                    if now >= next_info:
+                        next_info = now + 0.1
+                        tell(show.info())
+            except Exception as exc:
+                lights.stop("error %s" % exc)
+                retry_at = now + (QUICK_RETRY if fails < 3 else RETRY)
+                fails += 1
+    finally:
+        if lights and lights.active:
+            lights.stop()
+
+
+if __name__ == "__main__":
+    main()

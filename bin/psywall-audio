@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""psywall-audio — audio + wallpaper feed for the psywall Omarchy plugin.
+
+Listens to what is playing: the default sink's monitor, captured passively
+(it never wakes a sink). After MIC_AFTER seconds without playback it opens
+the default microphone instead, and closes it again as soon as playback
+resumes.
+
+Output (one line per frame, ~60/s while anything is audible):
+  A <bass> <mids> <highs> <level> <beat> <src> <accent>
+      bands and overall level 0..1 after auto-gain; beat 1 on an onset
+      (kick for music, any hit for the mic) else 0; src m | i | -;
+      accent 0, or 0.05..1 on a melody/hi-hat onset (1-8 kHz spectral flux)
+  W <lo> <hi> <path>
+      the current wallpaper changed: luminance that is "fully dark" and the
+      dark/light split (Otsu) of that image, for the shader's mask
+  S <state>   status lines
+
+Music lines are held back by `delay` seconds, so what's drawn lines up with
+what's heard on the device actually playing (AirPlay, or OwnTone streaming
+to an Apple TV, plays ~1.5-2 s after PipeWire hands it the audio). The
+device is reported as `S output <id>`: the default sink's name, or
+`owntone:<speakers>` when that sink is OwnTone's pipe — OwnTone's API says
+which speakers it is playing on. The shell plugin keeps a delay per device
+and sends the right one. The mic is never delayed.
+
+Commands on stdin: `mic on` / `mic off` (allow the microphone fallback),
+`delay <s>` (the current device's latency), `tee <path>` / `tee off` (also append every
+emitted A line, timestamped, to a file: a recording for offline tuning that
+needs no second capture).
+EOF on stdin (the shell went away) ends the process and both captures.
+
+`psywall-audio --analyze <image>` prints just the W line for that image.
+"""
+
+import ctypes
+import fcntl
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import deque
+
+try:
+    import numpy as np
+except ImportError:
+    # Not part of a stock Omarchy install; the psywall pane offers to add it.
+    print("S missing python-numpy", flush=True)
+    sys.exit(3)
+
+RATE = 48000
+N = 2048
+FPS = 60
+IDLE_FPS = 10
+FLOOR = -100.0
+MUSIC_GATE = -80.0   # dBFS; below this the monitor counts as silent
+MIC_AFTER = 2.0      # s of silent playback before the mic takes over
+SINK_CHECK = 2.0     # s between looks at which output is the default
+OWNTONE_API = "http://localhost:3689/api/outputs"
+BACKGROUND = os.path.expanduser("~/.local/state/omarchy/current/background")
+PR_SET_PDEATHSIG = 1
+F_SETPIPE_SZ = 1031
+
+BANDS = (("bass", 30, 160), ("mids", 250, 2500), ("highs", 4000, 14000), ("level", 30, 14000))
+
+
+def set_pdeathsig(sig):
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0)
+    except OSError:
+        pass
+
+
+def say(text):
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        raise SystemExit(0)
+
+
+class Capture:
+    """Supervised pw-record, stereo f32 at RATE, drained without blocking."""
+
+    def __init__(self, name, props):
+        self.name = name
+        self.props = props
+        self.proc = None
+        self.pending = b""
+        self.retry_at = 0.0
+        self.failures = 0
+
+    def start(self):
+        self.stop()
+        cmd = ["pw-record", "-P", self.props, "--rate", str(RATE), "--channels", "2", "--format", "f32", "-"]
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                preexec_fn=lambda: set_pdeathsig(signal.SIGKILL))
+            os.set_blocking(self.proc.stdout.fileno(), False)
+            try:  # ~1 s of audio, so frame-paced draining never stalls pw-record
+                fcntl.fcntl(self.proc.stdout.fileno(), F_SETPIPE_SZ, 1 << 19)
+            except OSError:
+                pass
+            say("S capturing %s" % self.name)
+        except OSError as exc:
+            self.proc = None
+            self._fail("spawn %s" % exc)
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        self.pending = b""
+
+    def _fail(self, why):
+        self.stop()
+        self.failures += 1
+        delay = min(10.0, 1.0 * self.failures)
+        self.retry_at = time.monotonic() + delay
+        say("S restart %s %.0fs %s" % (self.name, delay, why))
+
+    def read(self):
+        """Everything queued in the pipe as one mono float32 block."""
+        empty = np.empty(0, dtype=np.float32)
+        if self.proc is None:
+            return empty
+        chunks = []
+        while True:
+            try:
+                data = os.read(self.proc.stdout.fileno(), 1 << 19)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                self._fail("read %s" % exc)
+                return empty
+            if not data:
+                self._fail("pw-record exited")
+                return empty
+            chunks.append(data)
+        if not chunks:
+            return empty
+        self.failures = 0
+        buf = self.pending + b"".join(chunks)
+        usable = len(buf) - (len(buf) % 8)
+        self.pending = buf[usable:]
+        if usable == 0:
+            return empty
+        st = np.frombuffer(buf[:usable], dtype=np.float32).reshape(-1, 2)
+        mono = (st[:, 0] + st[:, 1]) * 0.5
+        return np.nan_to_num(mono, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class Gain:
+    """Auto-gain for one band: maps the top RANGE dB under a decaying peak onto
+    0..1, so quiet songs, loud songs and a microphone all use the full range.
+    A floor that follows the quiet parts (room tone, the gaps between kicks)
+    gates out anything less than GATE dB above it."""
+
+    RANGE = 20.0
+    FLOOR_RISE = 2.0   # dB/s the floor creeps up; it drops instantly
+    PEAK_FALL = 4.0    # dB/s
+    GATE = 6.0
+    HEADROOM = 24.0    # the peak never sinks closer than this to the floor
+
+    def __init__(self):
+        self.floor = None
+        self.peak = None
+
+    def __call__(self, db, dt):
+        if self.floor is None:
+            self.floor, self.peak = db, db
+        if db < self.floor:
+            self.floor = db
+        else:
+            self.floor += min(db - self.floor, self.FLOOR_RISE * dt)
+        self.peak = max(db, self.peak - self.PEAK_FALL * dt, self.floor + self.HEADROOM)
+        lo = max(self.peak - self.RANGE, self.floor + self.GATE)
+        if db <= FLOOR + 1:
+            return 0.0
+        return float(min(1.0, max(0.0, (db - lo) / max(1.0, self.peak - lo))))
+
+
+class Onset:
+    """A jump of JUMP dB over the last ~0.4 s, at least GAP s after the last."""
+
+    JUMP = 4.5
+    GAP = 0.22
+
+    def __init__(self):
+        self.hist = deque(maxlen=24)
+        self.last = 0.0
+
+    def __call__(self, db, norm, now):
+        mean = sum(self.hist) / len(self.hist) if self.hist else db
+        self.hist.append(db)
+        if db - mean > self.JUMP and norm > 0.3 and now - self.last > self.GAP:
+            self.last = now
+            return 1
+        return 0
+
+
+class Accent:
+    """Melody / hi-hat onsets: spectral flux over MEL_LO..MEL_HI (the mean
+    rise, in dB, of every bin since the last frame), peak-picked above an
+    adaptive threshold (median + K x MAD of the last ~1 s, the MAD floored so
+    near-silent stretches don't make every blip look huge), at least GAP
+    apart. Returns 0, or the peak's size relative to the loudest recent
+    accent (a reference that halves every REF_HALF s) as 0.05..1 — so loud
+    hits score near 1 and soft ones proportionally lower."""
+
+    K = 2.5
+    GAP = 0.12
+    MAD_FLOOR = 0.3   # dB
+    REF_HALF = 4.0    # s
+
+    def __init__(self):
+        self.hist = deque(maxlen=60)
+        self.prev = self.prev2 = 0.0
+        self.last = 0.0
+        self.ref = 0.0
+        self.t_prev = None
+
+    def __call__(self, flux, now):
+        if self.t_prev is not None:
+            self.ref *= 0.5 ** ((now - self.t_prev) / self.REF_HALF)
+        self.t_prev = now
+        self.hist.append(flux)
+        h = sorted(self.hist)
+        med = h[len(h) // 2]
+        mad = max(sorted(abs(x - med) for x in h)[len(h) // 2], self.MAD_FLOOR)
+        out = 0.0
+        # the previous frame was a local peak and cleared the threshold
+        if (self.prev > med + self.K * mad and self.prev >= self.prev2 and self.prev > flux
+                and now - self.last > self.GAP):
+            self.ref = max(self.ref, self.prev)
+            out = min(1.0, max(0.05, self.prev / self.ref))
+            self.last = now
+        self.prev2, self.prev = self.prev, flux
+        return out
+
+
+MEL_LO, MEL_HI = 1000, 8000
+KICK_GUARD = 0.05   # s; a kick's beater click lands in the melody band too
+
+
+class Features:
+    def __init__(self):
+        self.window = np.hanning(N).astype(np.float32)
+        freqs = np.fft.rfftfreq(N, 1.0 / RATE)
+        self.masks = [(freqs >= lo) & (freqs < hi) for _, lo, hi in BANDS]
+        self.mel_mask = (freqs >= MEL_LO) & (freqs < MEL_HI)
+        # a full-scale sine inside a band reads ~0 dB
+        self.scale = 4.0 / float(self.window.sum()) ** 2
+        self.reset()
+
+    def reset(self):
+        self.ring = np.zeros(N, dtype=np.float32)
+        self.gains = [Gain() for _ in BANDS]
+        self.onset = Onset()
+        self.accent = Accent()
+        self.prev_mel = None
+        self.held, self.held_t = 0.0, 0.0   # accent waiting one frame for a kick to cancel it
+        self.last_beat = -1e9
+
+    def push(self, mono):
+        m = len(mono)
+        if m >= N:
+            self.ring[:] = mono[-N:]
+        else:
+            self.ring[:-m] = self.ring[m:]
+            self.ring[-m:] = mono
+
+    def frame(self, fresh, dt, now, onset_band):
+        flux = 0.0
+        if fresh:
+            spec = np.fft.rfft(self.ring * self.window)
+            power = (spec.real ** 2 + spec.imag ** 2) * self.scale
+            dbs = [max(FLOOR, 10.0 * np.log10(max(float(power[mk].sum()), 1e-12))) for mk in self.masks]
+            # Per-bin dB, floored 70 dB under the loudest bin of the whole
+            # spectrum: a kick's leakage into this band sits far below that,
+            # while a quiet hi-hat doesn't. (Flooring against this band's own
+            # peak made a near-silent band's leakage look like big onsets.)
+            mel = 10.0 * np.log10(power[self.mel_mask] + 1e-12)
+            mel = np.maximum(mel, 10.0 * np.log10(float(power.max()) + 1e-12) - 70.0)
+            if self.prev_mel is not None:
+                flux = float(np.maximum(mel - self.prev_mel, 0.0).mean())
+            self.prev_mel = mel
+        else:
+            dbs = [FLOOR] * len(BANDS)
+            self.prev_mel = None
+        norms = [g(db, dt) for g, db in zip(self.gains, dbs)]
+        beat = self.onset(dbs[onset_band], norms[onset_band], now)
+        new = self.accent(flux, now) if max(norms) > 0 else 0.0
+        if beat:
+            self.last_beat = now
+        # Kicks belong to the beat layer: drop an accent within KICK_GUARD of
+        # one. Accents are held a frame so a kick flagged just after can still
+        # cancel it.
+        accent = 0.0
+        if self.held and abs(self.held_t - self.last_beat) >= KICK_GUARD:
+            accent = self.held
+        self.held, self.held_t = new, now
+        return norms, beat, accent
+
+
+class Delay:
+    """Holds A lines back by `seconds`, the current output's playback latency."""
+
+    def __init__(self):
+        self.seconds = 0.0
+        self.q = deque()
+
+    @property
+    def pending(self):
+        return bool(self.q)
+
+    def reset(self, seconds):
+        self.seconds = seconds
+        self.q.clear()   # keeping them would reorder old and new lines
+
+    def push(self, line, now):
+        self.q.append((now + self.seconds, line))
+
+    def due(self, now):
+        out = []
+        while self.q and self.q[0][0] <= now:
+            out.append(self.q.popleft()[1])
+        return out
+
+
+def output_ident(sink):
+    """The device the music really goes to: the default sink's name, or
+    owntone:<selected speakers> when that sink is OwnTone's pipe."""
+    if not sink.startswith("owntone"):
+        return sink
+    try:
+        with urllib.request.urlopen(OWNTONE_API, timeout=0.5) as r:
+            outs = json.load(r).get("outputs", [])
+        names = sorted(o["name"] for o in outs if o.get("selected"))
+    except Exception:
+        return "owntone:?"
+    return "owntone:" + ("+".join(names) if names else "none")
+
+
+def rms_db(mono):
+    if not len(mono):
+        return FLOOR
+    return max(FLOOR, 10.0 * np.log10(max(float(np.mean(mono * mono)), 1e-12)))
+
+
+def analyze(path):
+    """(lo, hi): the luminance that gets the full effect and the image's
+    dark/light split. Luma is Rec.709 on sRGB-encoded values, like the shader."""
+    try:
+        raw = subprocess.run(
+            ["magick", path + "[0]", "-resize", "480x480>", "-depth", "8", "rgb:-"],
+            capture_output=True, timeout=30).stdout
+        px = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.float32) / 255.0
+        if not len(px):
+            raise ValueError("no pixels")
+    except Exception:
+        return 0.0, 0.25
+    lum = px @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    hist = np.bincount(np.clip((lum * 255).astype(int), 0, 255), minlength=256).astype(np.float64)
+    hist /= hist.sum()
+    w = np.cumsum(hist)
+    mu = np.cumsum(hist * np.arange(256))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = (mu[-1] * w - mu) ** 2 / (w * (1.0 - w))
+    t = int(np.argmax(np.nan_to_num(between, nan=0.0, posinf=0.0)))
+    hi = float(np.clip(t / 255.0, 0.08, 0.55))
+    dark = lum[lum <= hi]
+    lo = float(np.percentile(dark, 30)) if dark.size else 0.0
+    return max(0.0, min(lo, hi - 0.06)), hi
+
+
+def wall_line(path):
+    lo, hi = analyze(path)
+    return "W %.3f %.3f %s" % (lo, hi, path)
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--analyze":
+        print(wall_line(args[1]))
+        return
+    set_pdeathsig(signal.SIGTERM)
+    mic_allowed = "--no-mic" not in args
+
+    music = Capture("music", "{ stream.capture.sink = true node.passive = true node.name = psywall-music "
+                             "media.name = \"Psychedelic wallpaper\" }")
+    mic = Capture("mic", "{ node.name = psywall-mic media.name = \"Psychedelic wallpaper (mic)\" }")
+    feat = Features()
+
+    def shutdown(*_):
+        music.stop()
+        mic.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    music.start()
+    stdin_fd = sys.stdin.fileno()
+    stdin_buf = b""
+    start = last = time.monotonic()
+    music_heard = start
+    src = "m"
+    wall_path, wall_checked = None, 0.0
+    last_line, idle = "", False
+    delay = Delay()
+    output_delay = 0.0   # the plugin sends the current device's latency
+    sink_name, sink_checked = "", -1e9
+    tee, tee_t0 = None, 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+            if music.proc is None and now >= music.retry_at:
+                music.start()
+            want_mic = mic_allowed and now - music_heard > MIC_AFTER
+            if want_mic and mic.proc is None and now >= mic.retry_at:
+                mic.start()
+            elif not want_mic and mic.proc is not None:
+                mic.stop()
+            new_src = "i" if want_mic else "m"
+            if new_src != src:
+                src = new_src
+                feat.reset()
+
+            wait = max(0.0, last + 1.0 / (IDLE_FPS if idle else FPS) - now)
+            ready, _, _ = select.select([stdin_fd], [], [], wait)
+            if ready:
+                chunk = os.read(stdin_fd, 4096)
+                if not chunk:
+                    break
+                stdin_buf += chunk
+                while b"\n" in stdin_buf:
+                    raw, stdin_buf = stdin_buf.split(b"\n", 1)
+                    cmd = raw.decode("utf-8", "replace").split()
+                    if cmd[:1] == ["mic"] and len(cmd) == 2:
+                        mic_allowed = cmd[1] == "on"
+                    elif cmd[:1] == ["delay"] and len(cmd) == 2:
+                        try:
+                            output_delay = max(0.0, min(5.0, float(cmd[1])))
+                        except ValueError:
+                            pass
+                    elif cmd[:1] == ["tee"] and len(cmd) == 2:
+                        if tee:
+                            tee.close()
+                            tee = None
+                        if cmd[1] != "off":
+                            try:
+                                tee, tee_t0 = open(os.path.expanduser(cmd[1]), "a"), time.monotonic()
+                                say("S tee %s" % cmd[1])
+                            except OSError as exc:
+                                say("S tee failed %s" % exc)
+                continue
+
+            now = time.monotonic()
+            dt = min(0.25, now - last)
+            last = now
+
+            played = music.read()
+            if rms_db(played) > MUSIC_GATE:
+                music_heard = now
+            block = mic.read() if src == "i" else played
+            if len(block):
+                feat.push(block)
+            norms, beat, accent = feat.frame(len(block) > 0, dt, now, 3 if src == "i" else 0)
+            quiet = max(norms) <= 0.0
+            line = "A %.3f %.3f %.3f %.3f %d %s %.2f" % (norms[0], norms[1], norms[2], norms[3], beat,
+                                                       "-" if quiet else src, accent)
+            want = output_delay if src == "m" else 0.0
+            if want != delay.seconds:
+                delay.reset(want)
+            if line != last_line:
+                delay.push(line, now)
+                last_line = line
+            for out in delay.due(now):
+                say(out)
+                if tee:
+                    tee.write("%.4f %s\n" % (now - tee_t0, out))
+                    tee.flush()
+            idle = quiet and not delay.pending   # finish the delayed tail at full rate
+
+            if now - sink_checked >= SINK_CHECK:
+                sink_checked = now
+                try:
+                    name = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                                          text=True, timeout=2).stdout.strip()
+                    name = output_ident(name) if name else name
+                except Exception:
+                    name = sink_name
+                if name and name != sink_name:
+                    sink_name = name
+                    say("S output %s" % name)
+
+            if now - wall_checked >= 1.0:
+                wall_checked = now
+                path = os.path.realpath(BACKGROUND)
+                if path != wall_path and os.path.isfile(path):
+                    wall_path = path
+                    say(wall_line(path))
+    finally:
+        music.stop()
+        mic.stop()
+
+
+if __name__ == "__main__":
+    main()
